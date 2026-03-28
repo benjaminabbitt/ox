@@ -116,6 +116,8 @@ impl ComplementaryFilter {
 mod tests {
     use super::*;
 
+    // === LowPassFilter Tests ===
+
     #[test]
     fn lowpass_smooths_signal() {
         let mut filter = LowPassFilter::with_alpha(0.1);
@@ -124,6 +126,93 @@ mod tests {
         // Should be smoothed, not jump to 100
         assert!(filter.value() < 50.0);
     }
+
+    #[test]
+    fn lowpass_first_sample_initializes() {
+        let mut filter = LowPassFilter::with_alpha(0.5);
+        let output = filter.update(42.0);
+        assert_eq!(output, 42.0, "First sample should initialize to input");
+    }
+
+    #[test]
+    fn lowpass_converges_to_constant_input() {
+        let mut filter = LowPassFilter::with_alpha(0.3);
+        let target = 100.0;
+
+        for _ in 0..50 {
+            filter.update(target);
+        }
+
+        let error = (filter.value() - target).abs();
+        assert!(error < 1.0, "Should converge to constant input, error={}", error);
+    }
+
+    #[test]
+    fn lowpass_alpha_zero_ignores_new_samples() {
+        let mut filter = LowPassFilter::with_alpha(0.0);
+        filter.update(100.0); // Initialize
+        filter.update(0.0);
+        filter.update(0.0);
+
+        assert_eq!(filter.value(), 100.0, "Alpha=0 should ignore new samples");
+    }
+
+    #[test]
+    fn lowpass_alpha_one_tracks_immediately() {
+        let mut filter = LowPassFilter::with_alpha(1.0);
+        filter.update(100.0);
+        filter.update(50.0);
+
+        assert_eq!(filter.value(), 50.0, "Alpha=1 should track immediately");
+    }
+
+    #[test]
+    fn lowpass_reset_clears_state() {
+        let mut filter = LowPassFilter::with_alpha(0.5);
+        filter.update(100.0);
+        filter.reset();
+
+        assert_eq!(filter.value(), 0.0);
+        // Next update should reinitialize
+        let output = filter.update(42.0);
+        assert_eq!(output, 42.0);
+    }
+
+    #[test]
+    fn lowpass_rejects_high_frequency_noise() {
+        let mut filter = LowPassFilter::with_alpha(0.1);
+
+        // Alternating signal (high frequency noise)
+        let mut sum = 0.0;
+        for i in 0..100 {
+            let input = if i % 2 == 0 { 100.0 } else { -100.0 };
+            sum += filter.update(input);
+        }
+
+        // Average should be close to 0 (noise canceled)
+        let avg = sum / 100.0;
+        assert!(avg.abs() < 20.0, "Should filter high-frequency noise, avg={}", avg);
+    }
+
+    #[test]
+    fn lowpass_from_cutoff_frequency() {
+        // 10 Hz cutoff at 100 Hz sample rate
+        let filter = LowPassFilter::new(10.0, 100.0);
+        // Alpha should be reasonable (not 0 or 1)
+        // For this config, alpha ≈ 0.39
+        assert!(filter.alpha > 0.1 && filter.alpha < 0.9);
+    }
+
+    #[test]
+    fn lowpass_alpha_clamped() {
+        let filter1 = LowPassFilter::with_alpha(-1.0);
+        assert_eq!(filter1.alpha, 0.0);
+
+        let filter2 = LowPassFilter::with_alpha(2.0);
+        assert_eq!(filter2.alpha, 1.0);
+    }
+
+    // === ComplementaryFilter Tests ===
 
     #[test]
     fn complementary_tracks_gyro_short_term() {
@@ -137,5 +226,92 @@ mod tests {
 
         // Should track gyro more than accel
         assert!(filter.angle() > 0.5);
+    }
+
+    #[test]
+    fn complementary_tracks_accel_long_term() {
+        let mut filter = ComplementaryFilter::new(0.98);
+        filter.set_angle(0.0);
+
+        // Many updates with accel saying 45°, gyro saying no rotation
+        for _ in 0..500 {
+            filter.update(45.0, 0.0, 0.01);
+        }
+
+        // Should converge toward accel reading
+        let error = (filter.angle() - 45.0).abs();
+        assert!(error < 5.0, "Should converge to accel, error={}", error);
+    }
+
+    #[test]
+    fn complementary_zero_alpha_tracks_accel_only() {
+        let mut filter = ComplementaryFilter::new(0.0);
+        filter.set_angle(0.0);
+
+        filter.update(45.0, 100.0, 0.01); // Accel says 45, gyro says fast rotation
+
+        // Should immediately jump to accel
+        assert!((filter.angle() - 45.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn complementary_one_alpha_tracks_gyro_only() {
+        let mut filter = ComplementaryFilter::new(1.0);
+        filter.set_angle(0.0);
+
+        filter.update(45.0, 10.0, 0.1); // dt=0.1s, rate=10°/s -> +1°
+
+        // Should only integrate gyro
+        assert!((filter.angle() - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn complementary_reset_clears_angle() {
+        let mut filter = ComplementaryFilter::new(0.98);
+        filter.set_angle(90.0);
+        filter.reset();
+
+        assert_eq!(filter.angle(), 0.0);
+    }
+
+    #[test]
+    fn complementary_set_angle_works() {
+        let mut filter = ComplementaryFilter::new(0.98);
+        filter.set_angle(123.0);
+
+        assert_eq!(filter.angle(), 123.0);
+    }
+
+    #[test]
+    fn complementary_handles_negative_angles() {
+        let mut filter = ComplementaryFilter::new(0.98);
+        filter.set_angle(-45.0);
+
+        filter.update(-50.0, -5.0, 0.1);
+
+        assert!(filter.angle() < -45.0, "Should handle negative angles");
+    }
+
+    #[test]
+    fn complementary_alpha_clamped() {
+        let filter1 = ComplementaryFilter::new(-0.5);
+        assert_eq!(filter1.alpha, 0.0);
+
+        let filter2 = ComplementaryFilter::new(1.5);
+        assert_eq!(filter2.alpha, 1.0);
+    }
+
+    #[test]
+    fn complementary_gyro_drift_corrected_by_accel() {
+        let mut filter = ComplementaryFilter::new(0.98);
+        filter.set_angle(0.0);
+
+        // Gyro has drift of 0.1°/s, accel is stable at 0
+        for _ in 0..1000 {
+            filter.update(0.0, 0.1, 0.01);
+        }
+
+        // Drift should be bounded by accel correction
+        assert!(filter.angle().abs() < 5.0, "Gyro drift should be corrected, angle={}", filter.angle());
     }
 }

@@ -1,0 +1,24 @@
+# SCM Configuration
+# See https://github.com/SophisticatedContextManager/scm for documentation
+
+# Language model plugin configuration
+llm:
+  plugins:
+    claude-code: {}
+
+# Default settings
+defaults:
+  llm_plugin: claude-code
+  use_distilled: true
+
+# MCP server configuration
+mcp:
+  auto_register_scm: true
+
+# Session memory - save/resume conversations
+memory:
+  enabled: true
+  load_on_start: true
+  compaction:
+    model: haiku
+    plugin: claude-code

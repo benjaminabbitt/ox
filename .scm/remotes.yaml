@@ -1,0 +1,7 @@
+# SCM Remote Sources
+# Pre-configured remotes for common SCM bundles and profiles
+
+remotes:
+  scm-main:
+    url: https://github.com/SophisticatedContextManager/scm-main
+    version: v1
