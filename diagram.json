@@ -13,23 +13,37 @@
     {
       "type": "wokwi-led",
       "id": "led1",
-      "top": 100,
-      "left": 200,
+      "top": 50,
+      "left": 250,
       "attrs": { "color": "green" }
     },
     {
       "type": "wokwi-led",
       "id": "led2",
-      "top": 100,
-      "left": 240,
+      "top": 50,
+      "left": 290,
       "attrs": { "color": "red" }
     },
     {
       "type": "wokwi-pushbutton",
       "id": "btn1",
-      "top": 150,
-      "left": 200,
+      "top": 100,
+      "left": 250,
       "attrs": { "color": "blue" }
+    },
+    {
+      "type": "wokwi-mpu6050",
+      "id": "imu",
+      "top": 150,
+      "left": 250,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-servo",
+      "id": "servo1",
+      "top": 50,
+      "left": 350,
+      "attrs": {}
     }
   ],
   "connections": [
@@ -40,6 +54,13 @@
     [ "esp:3", "led2:A", "red", [ "h0" ] ],
     [ "led2:C", "esp:GND.1", "black", [ "v0" ] ],
     [ "esp:9", "btn1:1.l", "blue", [ "h0" ] ],
-    [ "btn1:2.l", "esp:GND.1", "black", [ "v0" ] ]
+    [ "btn1:2.l", "esp:GND.1", "black", [ "v0" ] ],
+    [ "esp:4", "imu:SDA", "orange", [ "h0" ] ],
+    [ "esp:5", "imu:SCL", "yellow", [ "h0" ] ],
+    [ "imu:VCC", "esp:3V3.1", "red", [ "v0" ] ],
+    [ "imu:GND", "esp:GND.1", "black", [ "v0" ] ],
+    [ "esp:6", "servo1:PWM", "purple", [ "h0" ] ],
+    [ "servo1:V+", "esp:3V3.1", "red", [ "v0" ] ],
+    [ "servo1:GND", "esp:GND.1", "black", [ "v0" ] ]
   ]
 }
