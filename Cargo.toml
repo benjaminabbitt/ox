@@ -28,7 +28,7 @@ embassy-futures = { version = "0.1", default-features = false }
 esp-hal = { version = "0.23", default-features = false }
 esp-hal-embassy = { version = "0.6", default-features = false, features = ["executors"] }
 esp-backtrace = { version = "0.15", default-features = false }
-esp-println = { version = "0.13", default-features = false, features = ["log", "uart"] }
+esp-println = { version = "0.13", default-features = false, features = ["defmt-espflash", "uart"] }
 
 # WiFi/BLE (feature-gated) - 0.12 matches esp-hal 0.23 release
 esp-wifi = { version = "0.12", default-features = false }

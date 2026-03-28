@@ -6,19 +6,26 @@
 //! - WiFi telemetry (feature: wifi)
 //! - BLE controller input (feature: ble) - HCI layer initialized
 //! - RC receiver support (feature: rc) - SBUS, CRSF/ELRS
+//! - GPS receiver (feature: gps) - NMEA/UBX protocols
+//! - Compass/magnetometer (feature: compass) - QMC5883L/HMC5883L
+//! - Autonomous navigation (feature: nav) - waypoint following
 //!
 //! Wiring:
 //! - GPIO 2: Green LED (status)
 //! - GPIO 3: Red LED (fault indicator)
 //! - GPIO 9: Button (mode switch)
-//! - GPIO 4: I2C SDA (MPU6050)
-//! - GPIO 5: I2C SCL (MPU6050)
+//! - GPIO 4: I2C SDA (MPU6050, Compass)
+//! - GPIO 5: I2C SCL (MPU6050, Compass)
 //! - GPIO 6: Servo PWM
+//! - GPIO 16: GPS TX -> ESP RX (when gps feature enabled)
+//! - GPIO 17: GPS RX <- ESP TX (when gps feature enabled)
 //! - GPIO 20: CRSF RX (when rc feature enabled)
 //! - GPIO 21: CRSF TX (when rc feature enabled)
 
 #![no_std]
 #![no_main]
+
+mod logging;
 
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -26,8 +33,18 @@ use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
+use esp_println as _; // Keep defmt global logger
+
+// Provide defmt timestamp
+defmt::timestamp!("{=u64:us}", embassy_time::Instant::now().as_micros());
 use esp_hal::gpio::{Input, Level, Output, Pull};
 use esp_hal::timer::timg::TimerGroup;
+
+// Rate extension for I2C frequency (compass)
+#[cfg(feature = "compass")]
+use fugit::RateExtU32;
+
+use logging::*;
 
 // Services
 use ox_services::motor::{MotorCommand, MotorServer, MotorServerConfig};
@@ -36,22 +53,52 @@ use ox_services::sensor::{ImuRaw, SensorServer};
 // HAL mocks for simulation
 use ox_hal::mock::{MockEncoder, MockMotor};
 
+// UART imports (shared by RC and GPS)
+#[cfg(any(feature = "rc", feature = "gps"))]
+use esp_hal::uart::{Config as UartConfig, Uart, UartRx};
+
+#[cfg(feature = "gps")]
+use esp_hal::uart::UartTx;
+
 // RC imports
 #[cfg(feature = "rc")]
+use ox_services::rc::{CrsfDecoder, RcServer, ChannelMap, FailsafeConfig};
+
+// GPS imports
+#[cfg(feature = "gps")]
+use ox_services::gps::{GpsConfig, GpsData, GpsServer, UbxConfigBuilder};
+
+// Compass imports
+#[cfg(feature = "compass")]
 use {
-    esp_hal::uart::{Config as UartConfig, Uart, UartRx},
-    ox_services::rc::{CrsfDecoder, RcServer, ChannelMap, FailsafeConfig},
+    esp_hal::i2c::master::I2c,
+    ox_services::compass::{CompassConfig, CompassData, CompassServer, Qmc5883l},
 };
+
+// Navigation imports
+#[cfg(feature = "nav")]
+use ox_services::nav::{NavCommand, NavConfig, NavServer, NavTelemetry};
+
+// Vehicle state machine imports
+#[cfg(feature = "vehicle")]
+use ox_services::vehicle::{VehicleCommand, VehicleMode, VehicleStateMachine, TransitionResult};
 
 // WiFi imports
 #[cfg(feature = "wifi")]
 use {
     embassy_net::{Config as NetConfig, Runner, Stack, StackResources},
     esp_wifi::wifi::{
-        ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState,
+        ClientConfiguration, Configuration, WifiController, WifiDevice,
+        WifiEvent as EspWifiEvent, WifiStaDevice,
     },
     ox_services::comms::{CommsConfig, CommsServer},
 };
+// Use local logging types (not esp_wifi's)
+#[cfg(feature = "wifi")]
+use crate::logging::{WifiEvent, WifiState};
+// Nav telemetry needs these when both nav and wifi enabled
+#[cfg(all(feature = "nav", feature = "wifi"))]
+use ox_services::comms::{TelemetryMessage, TelemetryType};
 
 // BLE imports
 #[cfg(feature = "ble")]
@@ -87,6 +134,29 @@ static MOTOR_CMD: Channel<CriticalSectionRawMutex, MotorCommand, 4> = Channel::n
 
 #[cfg(feature = "rc")]
 static RC_MOTOR_CMD: Channel<CriticalSectionRawMutex, MotorCommand, 4> = Channel::new();
+
+// GPS data channel (10Hz max)
+#[cfg(feature = "gps")]
+static GPS_DATA: Channel<CriticalSectionRawMutex, GpsData, 4> = Channel::new();
+
+// Compass data channel (50Hz)
+#[cfg(feature = "compass")]
+static COMPASS_DATA: Channel<CriticalSectionRawMutex, CompassData, 8> = Channel::new();
+
+// Navigation channels
+#[cfg(feature = "nav")]
+static NAV_CMD: Channel<CriticalSectionRawMutex, NavCommand, 4> = Channel::new();
+
+#[cfg(feature = "nav")]
+static NAV_MOTOR_CMD: Channel<CriticalSectionRawMutex, MotorCommand, 4> = Channel::new();
+
+// Vehicle state machine channels
+#[cfg(feature = "vehicle")]
+static VEHICLE_CMD: Channel<CriticalSectionRawMutex, VehicleCommand, 4> = Channel::new();
+
+// Navigation telemetry (when nav+wifi enabled)
+#[cfg(all(feature = "nav", feature = "wifi"))]
+static NAV_TELEMETRY: Channel<CriticalSectionRawMutex, NavTelemetry, 4> = Channel::new();
 
 // Timing statistics (thread-safe via Mutex)
 static TIMING_STATS: Mutex<CriticalSectionRawMutex, TimingStats> =
@@ -145,43 +215,53 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_hal_embassy::init(timg0.timer0);
 
-    // Initialize logging
-    esp_println::logger::init_logger_from_env();
+    // Log boot information
+    defmt::info!("================================");
+    defmt::info!("    Ox Robotics Microkernel");
+    defmt::info!("================================");
 
-    log::info!("================================");
-    log::info!("    Ox Robotics Microkernel");
-    log::info!("================================");
-    log::info!("Chip: {}", ox_chip::CHIP.name);
-    log::info!("Target control rate: {} Hz", 1_000_000 / CONTROL_PERIOD_US);
-
-    // Feature flags
-    #[cfg(feature = "wifi")]
-    log::info!("WiFi: ENABLED (SSID: {})", WIFI_SSID);
-    #[cfg(not(feature = "wifi"))]
-    log::info!("WiFi: disabled");
-
-    #[cfg(feature = "ble")]
-    log::info!("BLE: ENABLED (not yet implemented)");
-    #[cfg(not(feature = "ble"))]
-    log::info!("BLE: disabled");
-
-    #[cfg(feature = "rc")]
-    log::info!("RC: ENABLED (CRSF on GPIO20/21)");
-    #[cfg(not(feature = "rc"))]
-    log::info!("RC: disabled");
+    let boot_info = BootInfo {
+        chip: ox_chip::CHIP.name,
+        control_rate_hz: (1_000_000 / CONTROL_PERIOD_US) as u32,
+        #[cfg(feature = "wifi")]
+        wifi_enabled: true,
+        #[cfg(not(feature = "wifi"))]
+        wifi_enabled: false,
+        #[cfg(feature = "wifi")]
+        wifi_ssid: Some(WIFI_SSID),
+        #[cfg(not(feature = "wifi"))]
+        wifi_ssid: None,
+        #[cfg(feature = "ble")]
+        ble_enabled: true,
+        #[cfg(not(feature = "ble"))]
+        ble_enabled: false,
+        #[cfg(feature = "rc")]
+        rc_enabled: true,
+        #[cfg(not(feature = "rc"))]
+        rc_enabled: false,
+    };
+    log_boot!(boot_info);
 
     // ========== GPIO Setup ==========
     let led_green = Output::new(peripherals.GPIO2, Level::Low);
     let led_red = Output::new(peripherals.GPIO3, Level::Low);
     let button = Input::new(peripherals.GPIO9, Pull::Up);
 
-    log::info!("[GPIO] Status LED on GPIO2, Fault LED on GPIO3");
-    log::info!("[GPIO] Mode button on GPIO9");
+    log_gpio!(GpioConfig {
+        status_led_pin: 2,
+        fault_led_pin: 3,
+        button_pin: 9,
+    });
 
     // ========== CRSF/RC Setup ==========
     #[cfg(feature = "rc")]
     {
-        log::info!("[RC] Initializing CRSF receiver on UART...");
+        log_rc_config!(RcConfig {
+            protocol: RcProtocol::Crsf,
+            rx_pin: 20,
+            tx_pin: 21,
+            baud_rate: 420_000,
+        });
 
         // CRSF uses 420000 baud
         let uart_config = UartConfig::default().with_baudrate(420_000);
@@ -196,14 +276,14 @@ async fn main(spawner: Spawner) {
         let (rx, _tx) = uart.split();
 
         spawner.spawn(crsf_receiver_task(rx)).unwrap();
-        log::info!("[RC] CRSF receiver task spawned");
+        log_start!(Component::Crsf);
     }
 
     // ========== Radio Setup (WiFi/BLE shared) ==========
     // ESP32 supports WiFi+BLE coexistence via time-multiplexing
     #[cfg(any(feature = "wifi", feature = "ble"))]
     let (radio_controller, mut rng) = {
-        log::info!("[RADIO] Initializing shared radio controller...");
+        defmt::info!("radio: initializing shared controller");
 
         // Initialize RNG (needed for both WiFi and BLE)
         let rng = Rng::new(peripherals.RNG);
@@ -218,7 +298,7 @@ async fn main(spawner: Spawner) {
         );
 
         #[cfg(all(feature = "wifi", feature = "ble"))]
-        log::info!("[RADIO] WiFi + BLE coexistence enabled");
+        defmt::info!("radio: wifi+ble coexistence enabled");
 
         (init, rng)
     };
@@ -226,7 +306,7 @@ async fn main(spawner: Spawner) {
     // ========== WiFi Setup ==========
     #[cfg(feature = "wifi")]
     {
-        log::info!("[WIFI] Initializing WiFi stack...");
+        log_wifi!(WifiEvent { state: WifiState::Connecting, ssid: Some(WIFI_SSID) });
 
         // Create WiFi device in station mode
         let (wifi_interface, controller) =
@@ -252,24 +332,79 @@ async fn main(spawner: Spawner) {
         spawner.spawn(wifi_net_task(runner)).unwrap();
         spawner.spawn(wifi_telemetry_task(stack_ref)).unwrap();
 
-        log::info!("[WIFI] WiFi tasks spawned");
+        log_start!(Component::Wifi);
     }
 
     // ========== BLE Setup ==========
     #[cfg(feature = "ble")]
     {
-        log::info!("[BLE] Initializing BLE controller...");
+        defmt::info!("ble: initializing controller");
 
         // Create BLE connector (HCI interface) - shares radio with WiFi
         let connector = BleConnector::new(radio_controller, peripherals.BT);
 
         spawner.spawn(ble_controller_task(connector)).unwrap();
-        log::info!("[BLE] BLE controller task spawned");
+        log_start!(Component::Ble);
     }
 
     // Suppress unused variable warning when only one feature is enabled
     #[cfg(all(any(feature = "wifi", feature = "ble"), not(all(feature = "wifi", feature = "ble"))))]
     let _ = rng;
+
+    // ========== GPS Setup ==========
+    #[cfg(feature = "gps")]
+    {
+        defmt::info!("gps: configuring UART (GPIO 16 RX, GPIO 17 TX)");
+
+        // GPS modules typically start at 9600 baud
+        // After UBX config, we could switch to 115200 for higher throughput
+        let uart_config = UartConfig::default().with_baudrate(9600);
+
+        let uart = Uart::new(peripherals.UART0, uart_config)
+            .unwrap()
+            .with_rx(peripherals.GPIO16)
+            .with_tx(peripherals.GPIO17)
+            .into_async();
+
+        let (rx, tx) = uart.split();
+
+        spawner.spawn(gps_task(rx, tx)).unwrap();
+        defmt::info!("gps: task spawned");
+    }
+
+    // ========== Compass Setup ==========
+    #[cfg(feature = "compass")]
+    {
+        defmt::info!("compass: configuring I2C (GPIO 4 SDA, GPIO 5 SCL)");
+
+        // I2C bus for magnetometer (shared with IMU)
+        // QMC5883L runs at 400kHz max
+        let i2c_config = esp_hal::i2c::master::Config::default()
+            .with_frequency(400u32.kHz());
+
+        let i2c = I2c::new(peripherals.I2C0, i2c_config)
+            .unwrap()
+            .with_sda(peripherals.GPIO4)
+            .with_scl(peripherals.GPIO5)
+            .into_async();
+
+        spawner.spawn(compass_task(i2c)).unwrap();
+        defmt::info!("compass: task spawned");
+    }
+
+    // ========== Navigation Setup ==========
+    #[cfg(feature = "nav")]
+    {
+        spawner.spawn(nav_task()).unwrap();
+        defmt::info!("nav: task spawned (10Hz, consumes GPS + compass)");
+    }
+
+    // ========== Vehicle State Machine Setup ==========
+    #[cfg(feature = "vehicle")]
+    {
+        spawner.spawn(vehicle_task()).unwrap();
+        defmt::info!("vehicle: state machine spawned");
+    }
 
     // ========== Core Tasks ==========
     spawner.spawn(control_loop_task()).unwrap();
@@ -278,11 +413,10 @@ async fn main(spawner: Spawner) {
     spawner.spawn(button_task(button)).unwrap();
     spawner.spawn(timing_report_task()).unwrap();
 
-    log::info!("All tasks spawned");
-    log::info!("================================");
-    log::info!("Press button to cycle control modes:");
-    log::info!("  Coast -> Velocity -> Position -> E-Stop");
-    log::info!("================================");
+    defmt::info!("ready: all tasks spawned");
+    defmt::info!("================================");
+    defmt::info!("modes: Coast -> Velocity -> Position -> E-Stop");
+    defmt::info!("================================");
 
     // Main supervisor loop
     loop {
@@ -294,7 +428,7 @@ async fn main(spawner: Spawner) {
 /// Control loop task - runs motor and sensor servers at 1kHz
 #[embassy_executor::task]
 async fn control_loop_task() {
-    log::info!("[CTRL] Starting 1kHz control loop");
+    log_start!(Component::Control);
 
     // Create motor server with mock hardware
     let mut motor_server = MotorServer::new(
@@ -322,13 +456,25 @@ async fn control_loop_task() {
 
         // 1. Process button commands
         if let Ok(cmd) = MOTOR_CMD.try_receive() {
-            log::info!("[CTRL] Button command: {:?}", cmd);
+            let event = match cmd {
+                MotorCommand::SetVelocity { left, right } => MotorEvent::SetVelocity { left, right },
+                MotorCommand::SetPosition { left, right } => MotorEvent::SetPosition { left, right },
+                MotorCommand::Coast => MotorEvent::Coast,
+                MotorCommand::EmergencyStop => MotorEvent::EmergencyStop,
+            };
+            log_motor!(Component::Button, event);
             motor_server.process_command(cmd);
         }
 
-        // 2. Process RC commands (higher priority)
+        // 2. Process RC commands (highest priority - manual override)
         #[cfg(feature = "rc")]
         if let Ok(cmd) = RC_MOTOR_CMD.try_receive() {
+            motor_server.process_command(cmd);
+        }
+
+        // 3. Process NAV commands (lower priority than RC)
+        #[cfg(feature = "nav")]
+        if let Ok(cmd) = NAV_MOTOR_CMD.try_receive() {
             motor_server.process_command(cmd);
         }
 
@@ -349,12 +495,19 @@ async fn control_loop_task() {
         iteration += 1;
         if iteration % 1000 == 0 {
             let status = motor_server.status();
-            log::info!(
-                "[CTRL] Mode: {:?}, Iter: {}, Loop: {}us",
-                status.mode,
-                iteration,
-                elapsed_us
-            );
+            let event = match status.mode {
+                ox_services::motor::ControlMode::Coast => MotorEvent::Coast,
+                ox_services::motor::ControlMode::Velocity => MotorEvent::SetVelocity {
+                    left: status.left_velocity,
+                    right: status.right_velocity,
+                },
+                ox_services::motor::ControlMode::Position => MotorEvent::SetPosition {
+                    left: status.left_position,
+                    right: status.right_position,
+                },
+                ox_services::motor::ControlMode::Stopped => MotorEvent::EmergencyStop,
+            };
+            defmt::info!("ctrl: iteration={}, loop_us={}, mode={}", iteration, elapsed_us, event);
         }
 
         // Wait for next control period
@@ -372,7 +525,7 @@ async fn control_loop_task() {
 async fn crsf_receiver_task(mut rx: UartRx<'static, esp_hal::Async>) {
     use embedded_io_async::Read;
 
-    log::info!("[CRSF] Starting CRSF receiver task");
+    log_start!(Component::Crsf);
 
     let mut decoder = CrsfDecoder::new();
     let mut rc_server = RcServer::new(ChannelMap::default(), FailsafeConfig::default());
@@ -406,20 +559,21 @@ async fn crsf_receiver_task(mut rx: UartRx<'static, esp_hal::Async>) {
                         let _ = RC_MOTOR_CMD.try_send(cmd);
                     }
 
-                    // Log occasionally
+                    // Log RC data
                     if decoder.link_quality() > 0 {
-                        log::debug!(
-                            "[CRSF] T:{:.2} S:{:.2} LQ:{} RSSI:{}",
-                            throttle,
-                            steering,
-                            decoder.link_quality(),
-                            decoder.rssi()
-                        );
+                        log_rc_data!(RcChannelData {
+                            throttle: (throttle * 1000.0) as i16,
+                            steering: (steering * 1000.0) as i16,
+                            link_quality: decoder.link_quality(),
+                            rssi: decoder.rssi(),
+                            armed: rc_server.is_armed(),
+                            failsafe: rc_server.is_failsafe(),
+                        });
                     }
                 }
             }
-            Err(e) => {
-                log::warn!("[CRSF] UART error: {:?}", e);
+            Err(_e) => {
+                log_warn!(Component::Crsf, "uart_error");
                 Timer::after(Duration::from_millis(10)).await;
             }
         }
@@ -437,7 +591,7 @@ async fn crsf_receiver_task(mut rx: UartRx<'static, esp_hal::Async>) {
 /// Status LED task - indicates control mode
 #[embassy_executor::task]
 async fn status_led_task(mut led: Output<'static>) {
-    log::info!("[LED] Status LED task started");
+    log_start!(Component::Led);
 
     loop {
         // Blink pattern indicates system is running
@@ -463,7 +617,7 @@ async fn fault_led_task(mut led: Output<'static>) {
 /// Button task - cycles through control modes
 #[embassy_executor::task]
 async fn button_task(button: Input<'static>) {
-    log::info!("[BTN] Button task started");
+    log_start!(Component::Button);
 
     let mut last_state = true;
     let mut mode_index = 0u8;
@@ -475,6 +629,13 @@ async fn button_task(button: Input<'static>) {
         MotorCommand::EmergencyStop,
     ];
 
+    let events = [
+        MotorEvent::Coast,
+        MotorEvent::SetVelocity { left: 500, right: 500 },
+        MotorEvent::SetPosition { left: 1000, right: 1000 },
+        MotorEvent::EmergencyStop,
+    ];
+
     loop {
         let current = button.is_high();
 
@@ -483,7 +644,7 @@ async fn button_task(button: Input<'static>) {
             mode_index = (mode_index + 1) % modes.len() as u8;
             let cmd = modes[mode_index as usize];
 
-            log::info!("[BTN] Button pressed - sending {:?}", cmd);
+            log_button!(ButtonEvent { command: events[mode_index as usize] });
             let _ = MOTOR_CMD.try_send(cmd);
         }
         last_state = current;
@@ -495,7 +656,7 @@ async fn button_task(button: Input<'static>) {
 /// Timing report task - prints control loop statistics
 #[embassy_executor::task]
 async fn timing_report_task() {
-    log::info!("[TIME] Timing report task started");
+    log_start!(Component::Timing);
 
     // Wait for control loop to stabilize
     Timer::after(Duration::from_secs(2)).await;
@@ -507,16 +668,15 @@ async fn timing_report_task() {
 
         if stats.count > 0 {
             let meets_target = stats.max_us < CONTROL_PERIOD_US;
-            let status = if meets_target { "OK" } else { "EXCEEDED" };
 
-            log::info!("================================");
-            log::info!("[TIME] Control Loop Statistics:");
-            log::info!("  Iterations: {}", stats.count);
-            log::info!("  Min: {}us", stats.min_us);
-            log::info!("  Max: {}us", stats.max_us);
-            log::info!("  Avg: {}us", stats.avg_us());
-            log::info!("  Target: {}us - {}", CONTROL_PERIOD_US, status);
-            log::info!("================================");
+            log_timing!(logging::TimingStats {
+                count: stats.count,
+                min_us: stats.min_us as u32,
+                max_us: stats.max_us as u32,
+                avg_us: stats.avg_us() as u32,
+                target_us: CONTROL_PERIOD_US as u32,
+                within_budget: meets_target,
+            });
 
             // Reset stats for next period
             stats.reset();
@@ -530,14 +690,14 @@ async fn timing_report_task() {
 #[cfg(feature = "wifi")]
 #[embassy_executor::task]
 async fn wifi_connection_task(mut controller: WifiController<'static>) {
-    log::info!("[WIFI] Starting connection task");
+    log_start!(Component::Wifi);
 
     loop {
         // Wait for WiFi to be ready
-        if matches!(esp_wifi::wifi::wifi_state(), WifiState::StaConnected) {
+        if matches!(esp_wifi::wifi::wifi_state(), esp_wifi::wifi::WifiState::StaConnected) {
             // Already connected, wait for disconnect event
-            controller.wait_for_event(WifiEvent::StaDisconnected).await;
-            log::warn!("[WIFI] Disconnected from AP");
+            controller.wait_for_event(EspWifiEvent::StaDisconnected).await;
+            log_wifi!(WifiEvent { state: WifiState::Disconnected, ssid: Some(WIFI_SSID) });
             Timer::after(Duration::from_secs(1)).await;
         }
 
@@ -549,17 +709,16 @@ async fn wifi_connection_task(mut controller: WifiController<'static>) {
                 ..Default::default()
             });
             controller.set_configuration(&client_config).unwrap();
-            log::info!("[WIFI] Starting WiFi...");
+            defmt::debug!("wifi: starting");
             controller.start_async().await.unwrap();
-            log::info!("[WIFI] WiFi started");
         }
 
         // Connect to AP
-        log::info!("[WIFI] Connecting to {}...", WIFI_SSID);
+        log_wifi!(WifiEvent { state: WifiState::Connecting, ssid: Some(WIFI_SSID) });
         match controller.connect_async().await {
-            Ok(_) => log::info!("[WIFI] Connected to AP"),
-            Err(e) => {
-                log::warn!("[WIFI] Connection failed: {:?}", e);
+            Ok(_) => log_wifi!(WifiEvent { state: WifiState::Connected, ssid: Some(WIFI_SSID) }),
+            Err(_e) => {
+                log_wifi!(WifiEvent { state: WifiState::Error, ssid: Some(WIFI_SSID) });
                 Timer::after(Duration::from_secs(5)).await;
             }
         }
@@ -570,7 +729,7 @@ async fn wifi_connection_task(mut controller: WifiController<'static>) {
 #[cfg(feature = "wifi")]
 #[embassy_executor::task]
 async fn wifi_net_task(mut runner: Runner<'static, WifiDevice<'static, WifiStaDevice>>) {
-    log::info!("[WIFI] Starting network stack");
+    defmt::debug!("wifi: network stack running");
     runner.run().await;
 }
 
@@ -578,7 +737,7 @@ async fn wifi_net_task(mut runner: Runner<'static, WifiDevice<'static, WifiStaDe
 #[cfg(feature = "wifi")]
 #[embassy_executor::task]
 async fn wifi_telemetry_task(stack: &'static Stack<'static>) {
-    log::info!("[WIFI] Starting telemetry task");
+    defmt::debug!("wifi: telemetry task starting");
 
     // Create comms server
     let mut config = CommsConfig::default();
@@ -592,12 +751,16 @@ async fn wifi_telemetry_task(stack: &'static Stack<'static>) {
         }
         Timer::after(Duration::from_millis(500)).await;
     }
-    log::info!("[WIFI] Link is up");
+    defmt::debug!("wifi: link up");
 
     // Wait for IP address
     loop {
         if let Some(cfg) = stack.config_v4() {
-            log::info!("[WIFI] Got IP: {}", cfg.address.address());
+            let ip = cfg.address.address().octets();
+            log_wifi!(WifiEvent {
+                state: WifiState::GotIp { ip },
+                ssid: Some(WIFI_SSID),
+            });
             break;
         }
         Timer::after(Duration::from_millis(500)).await;
@@ -605,7 +768,15 @@ async fn wifi_telemetry_task(stack: &'static Stack<'static>) {
 
     comms.start_connect();
     comms.on_connected();
-    log::info!("[WIFI] Telemetry ready");
+    defmt::info!("wifi: telemetry ready");
+
+    // Rate limiting for nav telemetry (5Hz = 200ms interval)
+    #[cfg(feature = "nav")]
+    const NAV_TELEMETRY_INTERVAL_MS: u64 = 200;
+    #[cfg(feature = "nav")]
+    let mut last_nav_telemetry = Instant::now();
+    #[cfg(feature = "nav")]
+    let mut nav_telem_count = 0u32;
 
     // Telemetry loop
     let mut iteration = 0u32;
@@ -615,27 +786,41 @@ async fn wifi_telemetry_task(stack: &'static Stack<'static>) {
         let timestamp = Instant::now().as_millis() as u32;
         comms.update(timestamp);
 
+        // Consume nav telemetry with rate limiting
+        #[cfg(feature = "nav")]
+        {
+            // Drain channel but only process at rate limit
+            while let Ok(nav_telem) = NAV_TELEMETRY.try_receive() {
+                let now = Instant::now();
+                if now.duration_since(last_nav_telemetry).as_millis() >= NAV_TELEMETRY_INTERVAL_MS {
+                    // Create telemetry message from nav data
+                    let mut msg = TelemetryMessage::new(TelemetryType::Nav, timestamp);
+                    let bytes = nav_telem.to_bytes();
+                    let _ = msg.payload.extend_from_slice(&bytes);
+
+                    // Queue for sending (ignore errors if buffer full)
+                    let _ = comms.send_telemetry(msg);
+                    last_nav_telemetry = now;
+                    nav_telem_count += 1;
+                }
+                // Older messages are dropped (rate limiting)
+            }
+        }
+
         // Log status periodically
         iteration += 1;
         if iteration % 100 == 0 {
             let stats = comms.stats();
-            log::info!(
-                "[WIFI] State: {:?}, TX: {}, RX: {}",
-                comms.state(),
-                stats.tx_count,
-                stats.rx_count
-            );
+            #[cfg(feature = "nav")]
+            defmt::info!("wifi: tx={}, rx={}, nav_telem={}", stats.tx_count, stats.rx_count, nav_telem_count);
+            #[cfg(not(feature = "nav"))]
+            defmt::info!("wifi: tx={}, rx={}, connected={}", stats.tx_count, stats.rx_count, comms.is_connected());
         }
 
         // Send queued telemetry messages
         while let Some(msg) = comms.pop_telemetry() {
             // In a real implementation, this would send over a socket
-            // For now, just log it
-            log::debug!(
-                "[WIFI] Telemetry: {:?} @ {}ms",
-                msg.msg_type,
-                msg.timestamp_ms
-            );
+            defmt::debug!("wifi: telemetry type={}, ts={}", msg.timestamp_ms, msg.timestamp_ms);
             comms.on_message_sent();
         }
 
@@ -655,18 +840,10 @@ async fn wifi_telemetry_task(stack: &'static Stack<'static>) {
 async fn ble_controller_task(_connector: BleConnector<'static>) {
     use esp_wifi::ble::{have_hci_read_data, read_hci};
 
-    log::info!("[BLE] Starting BLE controller task");
-    log::info!("[BLE] HCI interface ready");
-    log::info!("[BLE] Note: Full GATT peripheral requires additional library (bleps/trouble)");
+    log_start!(Component::Ble);
+    defmt::info!("ble: HCI interface ready (GATT requires bleps/trouble)");
 
     // BLE HCI event loop
-    // In a full implementation, this would:
-    // 1. Send HCI commands to set up advertising
-    // 2. Handle connection events
-    // 3. Process GATT read/write requests
-    //
-    // For now, we just log HCI activity to show the BLE stack is working
-
     let mut iteration = 0u32;
     let mut hci_events = 0u32;
     let mut hci_buffer = [0u8; 256];
@@ -678,21 +855,303 @@ async fn ble_controller_task(_connector: BleConnector<'static>) {
             let len = read_hci(&mut hci_buffer);
             if len > 0 {
                 hci_events += 1;
-                log::debug!(
-                    "[BLE] HCI packet received: {} bytes, total events: {}",
-                    len,
-                    hci_events
-                );
+                defmt::debug!("ble: hci_packet bytes={}, total={}", len, hci_events);
             }
         }
 
         // Log status periodically
         iteration += 1;
         if iteration % 100 == 0 {
-            log::info!("[BLE] Controller running, HCI events: {}", hci_events);
+            log_ble!(BleEvent {
+                hci_events,
+                connected: false, // TODO: track actual connection state
+            });
         }
 
         // Yield to other tasks
         Timer::after(Duration::from_millis(10)).await;
+    }
+}
+
+// ========== GPS Tasks ==========
+
+/// GPS receiver task - reads UART and parses NMEA/UBX
+///
+/// Wiring:
+/// - GPIO 16: GPS TX -> ESP RX
+/// - GPIO 17: GPS RX <- ESP TX (for UBX config commands)
+#[cfg(feature = "gps")]
+#[embassy_executor::task]
+async fn gps_task(mut rx: UartRx<'static, esp_hal::Async>, mut tx: UartTx<'static, esp_hal::Async>) {
+    use embedded_io_async::{Read, Write};
+
+    defmt::info!("[GPS] Starting GPS receiver task");
+
+    // Configure GPS for 10Hz output via UBX command
+    let mut cfg_buf = [0u8; 16];
+    let len = UbxConfigBuilder::build_cfg_rate(100, &mut cfg_buf); // 100ms = 10Hz
+    if tx.write_all(&cfg_buf[..len]).await.is_err() {
+        defmt::warn!("[GPS] Failed to send UBX config");
+    }
+
+    // Small delay for GPS to process config
+    Timer::after(Duration::from_millis(100)).await;
+
+    let mut server = GpsServer::new(GpsConfig::default());
+    let mut buf = [0u8; 1];
+    let mut last_log = Instant::now();
+
+    loop {
+        match rx.read(&mut buf).await {
+            Ok(_) => {
+                if let Some(data) = server.process_byte(buf[0]) {
+                    // Publish to IPC channel
+                    let _ = GPS_DATA.try_send(data);
+
+                    // Log periodically (not every update)
+                    if last_log.elapsed() > Duration::from_secs(5) {
+                        if data.valid {
+                            defmt::info!(
+                                "[GPS] lat={} lon={} alt={}m spd={}m/s sats={} fix={}",
+                                data.latitude as f32,
+                                data.longitude as f32,
+                                data.altitude,
+                                data.speed,
+                                data.satellites,
+                                data.fix as u8
+                            );
+                        } else {
+                            defmt::warn!("[GPS] No fix, sats={}", data.satellites);
+                        }
+                        last_log = Instant::now();
+                    }
+                }
+            }
+            Err(_) => {
+                defmt::warn!("[GPS] UART read error");
+                Timer::after(Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
+
+// ========== Compass Tasks ==========
+
+/// Compass task - reads I2C magnetometer and computes heading
+///
+/// Wiring (shared with IMU):
+/// - GPIO 4: I2C SDA
+/// - GPIO 5: I2C SCL
+#[cfg(feature = "compass")]
+#[embassy_executor::task]
+async fn compass_task(i2c: I2c<'static, esp_hal::Async>) {
+    defmt::info!("[COMPASS] Starting compass task");
+
+    // Local magnetic declination (update for your location!)
+    // https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml
+    let config = CompassConfig {
+        declination: -12.0, // Example: -12 degrees west
+        min_cal_samples: 200,
+    };
+    let mut server = CompassServer::new(config);
+
+    // Initialize QMC5883L
+    let mut mag = Qmc5883l::new(i2c);
+    if mag.init().is_err() {
+        defmt::error!("[COMPASS] Init failed");
+        return;
+    }
+
+    defmt::info!("[COMPASS] QMC5883L initialized");
+
+    let mut last_log = Instant::now();
+    let period = Duration::from_millis(20); // 50Hz
+
+    loop {
+        match mag.read() {
+            Ok(raw) => {
+                let data = server.process(raw);
+
+                // Publish to IPC channel
+                let _ = COMPASS_DATA.try_send(data);
+
+                // Log periodically
+                if last_log.elapsed() > Duration::from_secs(5) {
+                    let cal_status = match data.calibration {
+                        ox_services::compass::CalibrationStatus::Uncalibrated => "uncal",
+                        ox_services::compass::CalibrationStatus::Collecting => "collecting",
+                        ox_services::compass::CalibrationStatus::Calibrated => "cal",
+                    };
+                    defmt::info!(
+                        "[COMPASS] heading={} true={} cal={}",
+                        data.heading as i32,
+                        data.heading_true as i32,
+                        cal_status
+                    );
+                    last_log = Instant::now();
+                }
+            }
+            Err(_) => {
+                // NotReady is normal, just means no new data yet
+            }
+        }
+
+        Timer::after(period).await;
+    }
+}
+
+// ========== Navigation Tasks ==========
+
+/// Navigation task - runs waypoint following at 10Hz
+///
+/// Consumes GPS and compass data, produces motor commands.
+/// Priority: RC > NAV > Button
+#[cfg(feature = "nav")]
+#[embassy_executor::task]
+async fn nav_task() {
+    defmt::info!("[NAV] Starting navigation task");
+
+    let mut server = NavServer::new(NavConfig::default());
+    let period = Duration::from_millis(100); // 10Hz
+    let mut last_update = Instant::now();
+    let mut last_log = Instant::now();
+
+    loop {
+        // Calculate elapsed time
+        let now = Instant::now();
+        let elapsed_ms = now.duration_since(last_update).as_millis() as u32;
+        last_update = now;
+
+        // Consume GPS data (non-blocking)
+        while let Ok(gps) = GPS_DATA.try_receive() {
+            server.process_gps(gps);
+        }
+
+        // Consume compass data (non-blocking)
+        while let Ok(compass) = COMPASS_DATA.try_receive() {
+            server.process_compass(compass);
+        }
+
+        // Process external commands (non-blocking)
+        while let Ok(cmd) = NAV_CMD.try_receive() {
+            defmt::info!("[NAV] Received command");
+            server.process_command(cmd);
+        }
+
+        // Run navigation update
+        if let Some(motor_cmd) = server.update(elapsed_ms) {
+            let _ = NAV_MOTOR_CMD.try_send(motor_cmd);
+        }
+
+        // Publish telemetry (when WiFi enabled)
+        #[cfg(feature = "wifi")]
+        {
+            let timestamp = now.as_millis() as u32;
+            // Vehicle mode 0 = no vehicle state machine, just nav
+            let telem = server.telemetry(0, timestamp);
+            let _ = NAV_TELEMETRY.try_send(telem);
+        }
+
+        // Log status periodically
+        if last_log.elapsed() > Duration::from_secs(5) {
+            let status = server.status();
+            defmt::info!(
+                "[NAV] state={} wp={}/{} dist={}m err={}deg home={}",
+                status.state as u8,
+                status.waypoint_index,
+                status.waypoint_count,
+                status.distance_to_waypoint_m as i32,
+                status.heading_error_deg as i32,
+                if status.home_valid { "yes" } else { "no" }
+            );
+            last_log = Instant::now();
+        }
+
+        Timer::after(period).await;
+    }
+}
+
+// ========== Vehicle State Machine Task ==========
+
+/// Vehicle state machine task - manages vehicle mode and arming
+///
+/// Processes commands from RC/WiFi and coordinates with NavServer.
+/// Runs at 20Hz to handle mode transitions quickly.
+#[cfg(feature = "vehicle")]
+#[embassy_executor::task]
+async fn vehicle_task() {
+    defmt::info!("[VEHICLE] Starting vehicle state machine");
+
+    let mut vsm = VehicleStateMachine::new();
+    let period = Duration::from_millis(50); // 20Hz
+    let mut last_log = Instant::now();
+
+    // Initial state
+    vsm.set_no_faults(true);
+
+    loop {
+        // Process vehicle commands (from RC or WiFi)
+        while let Ok(cmd) = VEHICLE_CMD.try_receive() {
+            let result = vsm.process_command(cmd);
+            match result {
+                TransitionResult::Ok => {
+                    defmt::info!("[VEHICLE] Mode changed to {}", vsm.mode() as u8);
+
+                    // Handle mode-specific actions
+                    #[cfg(feature = "nav")]
+                    match vsm.mode() {
+                        VehicleMode::Auto => {
+                            let _ = NAV_CMD.try_send(NavCommand::Start);
+                        }
+                        VehicleMode::Rtl => {
+                            let _ = NAV_CMD.try_send(NavCommand::ReturnToHome);
+                        }
+                        VehicleMode::Disarmed | VehicleMode::Emergency => {
+                            let _ = NAV_CMD.try_send(NavCommand::Pause);
+                        }
+                        _ => {}
+                    }
+                }
+                TransitionResult::ArmingChecksFailed => {
+                    defmt::warn!("[VEHICLE] Arming checks failed: {}/{}",
+                        vsm.checks().passing_count(),
+                        ox_services::vehicle::ArmingChecks::total_checks()
+                    );
+                }
+                TransitionResult::NoMission => {
+                    defmt::warn!("[VEHICLE] No mission loaded");
+                }
+                TransitionResult::NoHome => {
+                    defmt::warn!("[VEHICLE] No home position set");
+                }
+                _ => {
+                    defmt::warn!("[VEHICLE] Command rejected");
+                }
+            }
+        }
+
+        // Update timing
+        vsm.update(50);
+
+        // Update arming checks from sensor data
+        #[cfg(feature = "gps")]
+        {
+            // Check if GPS data is fresh (would need GPS channel here)
+            // For now, this would be updated by nav_task
+        }
+
+        // Log status periodically
+        if last_log.elapsed() > Duration::from_secs(5) {
+            defmt::info!(
+                "[VEHICLE] mode={} checks={}/{} time={}s",
+                vsm.mode() as u8,
+                vsm.checks().passing_count(),
+                ox_services::vehicle::ArmingChecks::total_checks(),
+                vsm.time_in_mode_ms() / 1000
+            );
+            last_log = Instant::now();
+        }
+
+        Timer::after(period).await;
     }
 }

@@ -11,6 +11,10 @@ wifi = ["dep:embassy-net", "dep:smoltcp"]
 ble = []
 rc = []  # RC receiver support (SBUS, CRSF, IBUS, PPM)
 can = []
+gps = []  # GPS receiver support (NMEA, UBX)
+compass = []  # Compass/magnetometer support (QMC5883L, HMC5883L)
+nav = []  # Autonomous waypoint navigation
+vehicle = []  # Vehicle state machine
 
 [dependencies]
 ox-kernel = { path = "../ox-kernel" }
@@ -20,6 +24,7 @@ embassy-sync.workspace = true
 embassy-time.workspace = true
 heapless.workspace = true
 libm = "0.2"
+embedded-hal.workspace = true
 
 # WiFi/networking (optional)
 embassy-net = { workspace = true, optional = true }
@@ -27,4 +32,5 @@ smoltcp = { workspace = true, optional = true }
 
 [dev-dependencies]
 ox-hal = { path = "../ox-hal", features = ["mock"] }
+ox-test = { path = "../ox-test" }
 proptest.workspace = true

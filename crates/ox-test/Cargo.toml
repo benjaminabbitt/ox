@@ -14,3 +14,6 @@ ox-kernel = { path = "../ox-kernel" }
 ox-hal = { path = "../ox-hal", features = ["mock"] }
 ox-control = { path = "../ox-control" }
 proptest.workspace = true
+
+[dev-dependencies]
+ox-services = { path = "../ox-services", features = ["rc", "wifi"] }

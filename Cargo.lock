@@ -741,6 +741,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "960703930f9f3c899ddedd122ea27a09d6a612c22323157e524af5b18876448e"
 dependencies = [
+ "defmt 0.3.100",
  "esp-build",
  "log",
 ]
@@ -1242,6 +1243,7 @@ name = "ox-app"
 version = "0.1.0"
 dependencies = [
  "critical-section",
+ "defmt 0.3.100",
  "embassy-executor",
  "embassy-net",
  "embassy-sync 0.7.2",
@@ -1252,8 +1254,8 @@ dependencies = [
  "esp-hal-embassy",
  "esp-println",
  "esp-wifi",
+ "fugit",
  "heapless",
- "log",
  "ox-chip",
  "ox-control",
  "ox-hal",
@@ -1315,11 +1317,13 @@ dependencies = [
  "embassy-net",
  "embassy-sync 0.7.2",
  "embassy-time",
+ "embedded-hal 1.0.0",
  "heapless",
  "libm",
  "ox-control",
  "ox-hal",
  "ox-kernel",
+ "ox-test",
  "proptest",
  "smoltcp 0.11.0",
 ]
@@ -1331,6 +1335,7 @@ dependencies = [
  "ox-control",
  "ox-hal",
  "ox-kernel",
+ "ox-services",
  "proptest",
 ]
 

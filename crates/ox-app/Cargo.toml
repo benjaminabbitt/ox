@@ -22,6 +22,10 @@ ble = ["dep:esp-wifi", "esp-wifi/ble", "esp-wifi/esp32c3", "esp-wifi/esp-alloc"]
 wifi-s3 = ["ox-services/wifi", "dep:esp-wifi", "dep:embassy-net", "dep:smoltcp", "esp-wifi/wifi", "esp-wifi/esp32s3", "esp-wifi/esp-alloc"]
 ble-s3 = ["dep:esp-wifi", "esp-wifi/ble", "esp-wifi/esp32s3", "esp-wifi/esp-alloc"]
 rc = ["ox-services/rc"]  # RC receiver (SBUS, CRSF)
+gps = ["ox-services/gps"]  # GPS receiver (NMEA, UBX)
+compass = ["ox-services/compass"]  # Compass/magnetometer
+nav = ["ox-services/nav", "gps", "compass"]  # Autonomous waypoint navigation
+vehicle = ["ox-services/vehicle"]  # Vehicle state machine
 
 [dependencies]
 ox-kernel = { path = "../ox-kernel" }
@@ -44,7 +48,7 @@ esp-println.workspace = true
 # Utilities
 static_cell.workspace = true
 critical-section.workspace = true
-log.workspace = true
+defmt.workspace = true
 heapless.workspace = true
 embedded-io-async = "0.6"
 
@@ -52,3 +56,6 @@ embedded-io-async = "0.6"
 esp-wifi = { workspace = true, optional = true }
 embassy-net = { workspace = true, optional = true }
 smoltcp = { workspace = true, optional = true, features = ["proto-ipv4", "socket-tcp", "socket-udp"] }
+
+# I2C frequency helpers (for compass)
+fugit = "0.3"

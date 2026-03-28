@@ -1,6 +1,6 @@
 //! Test fixtures
 
-use ox_hal::mock::{MockMotor, MockEncoder, MockPwm, MockPin};
+use ox_hal::mock::{MockMotor, MockEncoder};
 
 /// Create a mock motor pair for testing
 pub fn mock_motors() -> (MockMotor, MockMotor) {

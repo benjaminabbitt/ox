@@ -76,6 +76,10 @@ pub enum TelemetryType {
     System,
     /// Heartbeat (connection keepalive)
     Heartbeat,
+    /// Navigation status (waypoint, position, heading)
+    Nav,
+    /// Vehicle state (mode, arming, checks)
+    Vehicle,
 }
 
 /// Telemetry message
