@@ -15,7 +15,7 @@ wifi = ["ox-services/wifi"]
 
 [dependencies]
 ox-kernel = { path = "../ox-kernel" }
-ox-hal = { path = "../ox-hal" }
+ox-hal = { path = "../ox-hal", features = ["mock"] }
 ox-chip = { path = "../ox-chip" }
 ox-control = { path = "../ox-control" }
 ox-services = { path = "../ox-services" }

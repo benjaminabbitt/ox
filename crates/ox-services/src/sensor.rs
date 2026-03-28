@@ -198,7 +198,7 @@ impl SensorServer {
     }
 
     /// Process encoder data and update odometry
-    pub fn process_encoders(&mut self, current: EncoderData, dt: f32) -> Pose2D {
+    pub fn process_encoders(&mut self, current: EncoderData, _dt: f32) -> Pose2D {
         let cfg = &self.odom_config;
 
         // Calculate wheel deltas (in counts)

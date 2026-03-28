@@ -1,47 +1,86 @@
-//! Ox Robotics Microkernel - HAL Test Firmware
+//! Ox Robotics Microkernel - MVP Demo
 //!
-//! Tests GPIO and I2C with simulated hardware in Wokwi.
+//! Demonstrates the microkernel architecture with:
+//! - Control loop timing verification (<1ms target)
+//! - GPIO server integration
+//! - Sensor fusion (simulated IMU data)
+//! - Motor control (simulated)
 //!
 //! Wiring (diagram.json):
-//! - GPIO 2: Green LED (output)
-//! - GPIO 3: Red LED (output)
-//! - GPIO 9: Button (input, active low)
+//! - GPIO 2: Green LED (status)
+//! - GPIO 3: Red LED (fault indicator)
+//! - GPIO 9: Button (mode switch)
 //! - GPIO 4: I2C SDA (MPU6050)
 //! - GPIO 5: I2C SCL (MPU6050)
-//! - GPIO 6: Servo PWM (simulated via fast GPIO toggle)
+//! - GPIO 6: Servo PWM
 
 #![no_std]
 #![no_main]
 
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_sync::channel::Channel;
+use embassy_sync::mutex::Mutex;
+use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::gpio::{Input, Level, Output, Pull};
-use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal::Async;
 
-// Kernel types
-#[allow(unused_imports)]
-use ox_kernel::cap::Cap;
-#[allow(unused_imports)]
-use ox_kernel::ipc::Stream;
+// Services
+use ox_services::motor::{MotorCommand, MotorServer, MotorServerConfig};
+use ox_services::sensor::{ImuRaw, SensorServer};
 
-// MPU6050 I2C address and registers
-// Note: I2C async blocks in Wokwi simulation - works on real hardware
-#[allow(dead_code)]
-const MPU6050_ADDR: u8 = 0x68;
-#[allow(dead_code)]
-const MPU6050_WHO_AM_I: u8 = 0x75;
-#[allow(dead_code)]
-const MPU6050_PWR_MGMT_1: u8 = 0x6B;
-#[allow(dead_code)]
-const MPU6050_ACCEL_XOUT_H: u8 = 0x3B;
+// HAL mocks for simulation
+use ox_hal::mock::{MockEncoder, MockMotor};
 
-// Signal for button press events
-static BUTTON_PRESSED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+// Control loop timing target
+const CONTROL_PERIOD_US: u64 = 1000; // 1ms = 1kHz
+
+// IPC channels
+static MOTOR_CMD: Channel<CriticalSectionRawMutex, MotorCommand, 4> = Channel::new();
+
+// Timing statistics (thread-safe via Mutex)
+static TIMING_STATS: Mutex<CriticalSectionRawMutex, TimingStats> =
+    Mutex::new(TimingStats::new());
+
+/// Timing statistics for control loop
+#[derive(Clone, Copy)]
+struct TimingStats {
+    min_us: u64,
+    max_us: u64,
+    total_us: u64,
+    count: u32,
+}
+
+impl TimingStats {
+    const fn new() -> Self {
+        Self {
+            min_us: u64::MAX,
+            max_us: 0,
+            total_us: 0,
+            count: 0,
+        }
+    }
+
+    fn record(&mut self, duration_us: u64) {
+        self.min_us = self.min_us.min(duration_us);
+        self.max_us = self.max_us.max(duration_us);
+        self.total_us += duration_us;
+        self.count += 1;
+    }
+
+    fn avg_us(&self) -> u64 {
+        if self.count > 0 {
+            self.total_us / self.count as u64
+        } else {
+            0
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
@@ -56,205 +95,198 @@ async fn main(spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
 
     log::info!("================================");
-    log::info!("  Ox HAL Test Firmware");
+    log::info!("    Ox Microkernel MVP Demo");
     log::info!("================================");
     log::info!("Chip: {}", ox_chip::CHIP.name);
+    log::info!("Target control rate: {} Hz", 1_000_000 / CONTROL_PERIOD_US);
 
     // ========== GPIO Setup ==========
     let led_green = Output::new(peripherals.GPIO2, Level::Low);
     let led_red = Output::new(peripherals.GPIO3, Level::Low);
     let button = Input::new(peripherals.GPIO9, Pull::Up);
-    let servo_pin = Output::new(peripherals.GPIO6, Level::Low);
 
-    log::info!("[GPIO] LEDs on GPIO2 (green), GPIO3 (red)");
-    log::info!("[GPIO] Button on GPIO9 (pull-up)");
-    log::info!("[GPIO] Servo signal on GPIO6");
+    log::info!("[GPIO] Status LED on GPIO2, Fault LED on GPIO3");
+    log::info!("[GPIO] Mode button on GPIO9");
 
-    // ========== I2C Setup ==========
-    let i2c_config = I2cConfig::default();
-    let i2c = I2c::new(peripherals.I2C0, i2c_config)
-        .unwrap()
-        .with_sda(peripherals.GPIO4)
-        .with_scl(peripherals.GPIO5)
-        .into_async();
+    // ========== Spawn Tasks ==========
+    spawner.spawn(control_loop_task()).unwrap();
+    spawner.spawn(status_led_task(led_green)).unwrap();
+    spawner.spawn(fault_led_task(led_red)).unwrap();
+    spawner.spawn(button_task(button)).unwrap();
+    spawner.spawn(timing_report_task()).unwrap();
 
-    log::info!("[I2C] Initialized on GPIO4 (SDA), GPIO5 (SCL)");
-
-    // ========== Spawn Test Tasks ==========
-    spawner.spawn(gpio_test_task(led_green, led_red)).unwrap();
-    spawner.spawn(button_monitor_task(button)).unwrap();
-    spawner.spawn(servo_simulate_task(servo_pin)).unwrap();
-
-    // I2C test disabled in Wokwi - async I2C blocks the executor.
-    // Uncomment for real hardware testing:
-    // spawner.spawn(i2c_test_task(i2c)).unwrap();
-    let _ = i2c;
-
-    log::info!("All HAL test tasks spawned");
+    log::info!("All tasks spawned");
+    log::info!("================================");
+    log::info!("Press button to cycle control modes:");
+    log::info!("  Coast -> Velocity -> Position -> Coast");
     log::info!("================================");
 
-    // Main loop - respond to button presses
+    // Main supervisor loop
     loop {
-        BUTTON_PRESSED.wait().await;
-        log::info!("[MAIN] Button press detected!");
+        Timer::after(Duration::from_secs(10)).await;
+        // Could add watchdog/health checks here
     }
 }
 
-/// GPIO test - alternates LEDs every 500ms
+/// Control loop task - runs motor and sensor servers at 1kHz
+///
+/// This is the heart of the microkernel - demonstrating:
+/// - Precise timing control
+/// - Server integration (motor, sensor)
+/// - IPC command processing
 #[embassy_executor::task]
-async fn gpio_test_task(mut led_green: Output<'static>, mut led_red: Output<'static>) {
-    log::info!("[GPIO] Starting LED blink test");
+async fn control_loop_task() {
+    log::info!("[CTRL] Starting 1kHz control loop");
 
-    let mut toggle = false;
-    let mut count = 0u32;
+    // Create motor server with mock hardware
+    let mut motor_server = MotorServer::new(
+        MockMotor::new(),
+        MockMotor::new(),
+        MockEncoder::new(1000),
+        MockEncoder::new(1000),
+        MotorServerConfig::default(),
+    );
+
+    // Create sensor server
+    let mut sensor_server = SensorServer::default();
+
+    // Simulated IMU data (as if robot is level)
+    let imu_raw = ImuRaw {
+        accel_z: 16384, // 1g on Z axis
+        ..Default::default()
+    };
+
+    let dt = CONTROL_PERIOD_US as f32 / 1_000_000.0;
+    let mut iteration = 0u32;
+
     loop {
-        if toggle {
-            led_green.set_high();
-            led_red.set_low();
-        } else {
-            led_green.set_low();
-            led_red.set_high();
-        }
-        toggle = !toggle;
-        count += 1;
+        let start = Instant::now();
 
-        // Log every 4 toggles (2 seconds)
-        if count % 4 == 0 {
-            log::info!("[GPIO] LED toggle count: {}", count);
+        // 1. Process any pending commands
+        if let Ok(cmd) = MOTOR_CMD.try_receive() {
+            log::info!("[CTRL] Command: {:?}", cmd);
+            motor_server.process_command(cmd);
         }
 
-        Timer::after(Duration::from_millis(500)).await;
+        // 2. Process sensor data
+        let _imu = sensor_server.process_imu(imu_raw, dt);
+
+        // 3. Run motor control loop
+        motor_server.update(dt);
+
+        // 4. Record timing
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        {
+            let mut stats = TIMING_STATS.lock().await;
+            stats.record(elapsed_us);
+        }
+
+        // Log occasional status
+        iteration += 1;
+        if iteration % 1000 == 0 {
+            let status = motor_server.status();
+            log::info!(
+                "[CTRL] Mode: {:?}, Iter: {}, Loop: {}us",
+                status.mode,
+                iteration,
+                elapsed_us
+            );
+        }
+
+        // Wait for next control period
+        let remaining = CONTROL_PERIOD_US.saturating_sub(elapsed_us);
+        if remaining > 0 {
+            Timer::after(Duration::from_micros(remaining)).await;
+        }
     }
 }
 
-/// Button monitor - signals main task on press
+/// Status LED task - indicates control mode
 #[embassy_executor::task]
-async fn button_monitor_task(button: Input<'static>) {
-    log::info!("[GPIO] Monitoring button on GPIO9");
+async fn status_led_task(mut led: Output<'static>) {
+    log::info!("[LED] Status LED task started");
 
-    let mut last_state = true; // Pull-up, so high when not pressed
+    loop {
+        // Blink pattern indicates system is running
+        led.set_high();
+        Timer::after(Duration::from_millis(100)).await;
+        led.set_low();
+        Timer::after(Duration::from_millis(900)).await;
+    }
+}
+
+/// Fault LED task - would indicate errors
+#[embassy_executor::task]
+async fn fault_led_task(mut led: Output<'static>) {
+    // Keep fault LED off (no faults in demo)
+    led.set_low();
+
+    // In a real system, this would monitor for faults
+    loop {
+        Timer::after(Duration::from_secs(1)).await;
+    }
+}
+
+/// Button task - cycles through control modes
+#[embassy_executor::task]
+async fn button_task(button: Input<'static>) {
+    log::info!("[BTN] Button task started");
+
+    let mut last_state = true;
+    let mut mode_index = 0u8;
+
+    let modes = [
+        MotorCommand::Coast,
+        MotorCommand::SetVelocity { left: 500, right: 500 },
+        MotorCommand::SetPosition { left: 1000, right: 1000 },
+        MotorCommand::EmergencyStop,
+    ];
+
     loop {
         let current = button.is_high();
 
-        // Detect falling edge (button press)
+        // Detect falling edge
         if last_state && !current {
-            BUTTON_PRESSED.signal(());
+            mode_index = (mode_index + 1) % modes.len() as u8;
+            let cmd = modes[mode_index as usize];
+
+            log::info!("[BTN] Button pressed - sending {:?}", cmd);
+            let _ = MOTOR_CMD.try_send(cmd);
         }
         last_state = current;
 
-        Timer::after(Duration::from_millis(50)).await; // Debounce
+        Timer::after(Duration::from_millis(50)).await;
     }
 }
 
-/// I2C test - reads MPU6050 WHO_AM_I and accelerometer data
-/// Note: Disabled in Wokwi (async I2C blocks executor), works on real hardware
-#[allow(dead_code)]
+/// Timing report task - prints control loop statistics
 #[embassy_executor::task]
-async fn i2c_test_task(mut i2c: I2c<'static, Async>) {
-    log::info!("[I2C] Starting MPU6050 test");
+async fn timing_report_task() {
+    log::info!("[TIME] Timing report task started");
 
-    // Small delay for I2C to stabilize
-    log::info!("[I2C] Waiting 100ms for I2C to stabilize...");
-    Timer::after(Duration::from_millis(100)).await;
-    log::info!("[I2C] Reading WHO_AM_I register...");
-
-    // Read WHO_AM_I register with timeout
-    let mut buf = [0u8; 1];
-    match with_timeout(
-        Duration::from_millis(500),
-        i2c.write_read(MPU6050_ADDR, &[MPU6050_WHO_AM_I], &mut buf),
-    )
-    .await
-    {
-        Ok(Ok(())) => {
-            log::info!("[I2C] MPU6050 WHO_AM_I: 0x{:02X} (expected 0x68)", buf[0]);
-        }
-        Ok(Err(e)) => {
-            log::error!("[I2C] Failed to read WHO_AM_I: {:?}", e);
-            return;
-        }
-        Err(_) => {
-            log::error!("[I2C] WHO_AM_I read timed out - I2C bus may be stuck");
-            return;
-        }
-    }
-
-    // Wake up MPU6050 (clear sleep bit)
-    match i2c.write(MPU6050_ADDR, &[MPU6050_PWR_MGMT_1, 0x00]).await {
-        Ok(()) => log::info!("[I2C] MPU6050 woken up"),
-        Err(e) => {
-            log::error!("[I2C] Failed to wake MPU6050: {:?}", e);
-            return;
-        }
-    }
-
-    // Periodically read accelerometer data
-    loop {
-        Timer::after(Duration::from_millis(1000)).await;
-
-        let mut accel_buf = [0u8; 6];
-        match i2c
-            .write_read(MPU6050_ADDR, &[MPU6050_ACCEL_XOUT_H], &mut accel_buf)
-            .await
-        {
-            Ok(()) => {
-                let ax = i16::from_be_bytes([accel_buf[0], accel_buf[1]]);
-                let ay = i16::from_be_bytes([accel_buf[2], accel_buf[3]]);
-                let az = i16::from_be_bytes([accel_buf[4], accel_buf[5]]);
-                log::info!("[I2C] Accel: X={:6} Y={:6} Z={:6}", ax, ay, az);
-            }
-            Err(e) => {
-                log::error!("[I2C] Accel read error: {:?}", e);
-            }
-        }
-    }
-}
-
-/// Servo simulation via GPIO pulse width (software PWM)
-///
-/// Generates ~50Hz signal with varying pulse width to control servo position.
-/// This demonstrates GPIO timing without requiring LEDC peripheral complexity.
-#[embassy_executor::task]
-async fn servo_simulate_task(mut pin: Output<'static>) {
-    log::info!("[PWM] Starting servo simulation (software PWM)");
-
-    // Servo pulse widths: 1ms (0°) to 2ms (180°) at 50Hz (20ms period)
-    const PERIOD_US: u64 = 20_000; // 20ms = 50Hz
-    const MIN_PULSE_US: u64 = 1000; // 1ms = 0 degrees
-    const MAX_PULSE_US: u64 = 2000; // 2ms = 180 degrees
-    const STEP_US: u64 = 50;
-
-    let mut pulse_us = MIN_PULSE_US;
-    let mut increasing = true;
-    let mut cycle_count = 0u32;
+    // Wait for control loop to stabilize
+    Timer::after(Duration::from_secs(2)).await;
 
     loop {
-        // Generate one PWM cycle
-        pin.set_high();
-        Timer::after(Duration::from_micros(pulse_us)).await;
-        pin.set_low();
-        Timer::after(Duration::from_micros(PERIOD_US - pulse_us)).await;
+        Timer::after(Duration::from_secs(5)).await;
 
-        cycle_count += 1;
+        let mut stats = TIMING_STATS.lock().await;
 
-        // Update pulse width every 10 cycles (~200ms)
-        if cycle_count % 10 == 0 {
-            let angle = ((pulse_us - MIN_PULSE_US) * 180) / (MAX_PULSE_US - MIN_PULSE_US);
-            log::info!("[PWM] Servo pulse: {}us (~{}°)", pulse_us, angle);
+        if stats.count > 0 {
+            let meets_target = stats.max_us < CONTROL_PERIOD_US;
+            let status = if meets_target { "OK" } else { "EXCEEDED" };
 
-            if increasing {
-                pulse_us += STEP_US;
-                if pulse_us >= MAX_PULSE_US {
-                    pulse_us = MAX_PULSE_US;
-                    increasing = false;
-                }
-            } else {
-                pulse_us -= STEP_US;
-                if pulse_us <= MIN_PULSE_US {
-                    pulse_us = MIN_PULSE_US;
-                    increasing = true;
-                }
-            }
+            log::info!("================================");
+            log::info!("[TIME] Control Loop Statistics:");
+            log::info!("  Iterations: {}", stats.count);
+            log::info!("  Min: {}us", stats.min_us);
+            log::info!("  Max: {}us", stats.max_us);
+            log::info!("  Avg: {}us", stats.avg_us());
+            log::info!("  Target: {}us - {}", CONTROL_PERIOD_US, status);
+            log::info!("================================");
+
+            // Reset stats for next period
+            stats.reset();
         }
     }
 }
