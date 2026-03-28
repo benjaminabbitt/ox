@@ -4,7 +4,7 @@
 //! - 1kHz control loop (<1ms latency)
 //! - Motor and sensor server integration
 //! - WiFi telemetry (feature: wifi)
-//! - BLE controller input (feature: ble) - TODO
+//! - BLE controller input (feature: ble) - HCI layer initialized
 //! - RC receiver support (feature: rc) - SBUS, CRSF/ELRS
 //!
 //! Wiring:
@@ -47,15 +47,21 @@ use {
 #[cfg(feature = "wifi")]
 use {
     embassy_net::{Config as NetConfig, Runner, Stack, StackResources},
-    esp_hal::rng::Rng,
-    esp_wifi::{
-        init as wifi_init,
-        wifi::{
-            ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState,
-        },
-        EspWifiController,
+    esp_wifi::wifi::{
+        ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState,
     },
     ox_services::comms::{CommsConfig, CommsServer},
+};
+
+// BLE imports
+#[cfg(feature = "ble")]
+use esp_wifi::ble::controller::BleConnector;
+
+// WiFi/BLE shared imports
+#[cfg(any(feature = "wifi", feature = "ble"))]
+use {
+    esp_hal::rng::Rng,
+    esp_wifi::{init as wifi_init, EspWifiController},
 };
 
 // WiFi configuration (set via environment or use defaults)
@@ -64,8 +70,8 @@ const WIFI_SSID: &str = env!("WIFI_SSID");
 #[cfg(feature = "wifi")]
 const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
 
-// Helper macro to create static variables at runtime
-#[cfg(feature = "wifi")]
+// Helper macro to create static variables at runtime (used by wifi and ble)
+#[cfg(any(feature = "wifi", feature = "ble"))]
 macro_rules! mk_static {
     ($t:ty, $val:expr) => {{
         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
@@ -235,6 +241,32 @@ async fn main(spawner: Spawner) {
         spawner.spawn(wifi_telemetry_task(stack_ref)).unwrap();
 
         log::info!("[WIFI] WiFi tasks spawned");
+    }
+
+    // ========== BLE Setup ==========
+    // Note: BLE-only mode (when wifi feature is disabled)
+    // WiFi and BLE can coexist but require shared radio initialization
+    #[cfg(all(feature = "ble", not(feature = "wifi")))]
+    {
+        log::info!("[BLE] Initializing BLE controller...");
+
+        // Initialize RNG
+        let rng = Rng::new(peripherals.RNG);
+
+        // Use TIMG1 for BLE (TIMG0 is used by Embassy time driver)
+        let timg1 = TimerGroup::new(peripherals.TIMG1);
+
+        // Initialize BLE controller (shares radio with WiFi when both enabled)
+        let ble_init = mk_static!(
+            EspWifiController<'static>,
+            wifi_init(timg1.timer0, rng, peripherals.RADIO_CLK).unwrap()
+        );
+
+        // Create BLE connector (HCI interface)
+        let connector = BleConnector::new(ble_init, peripherals.BT);
+
+        spawner.spawn(ble_controller_task(connector)).unwrap();
+        log::info!("[BLE] BLE controller task spawned");
     }
 
     // ========== Core Tasks ==========
@@ -606,5 +638,59 @@ async fn wifi_telemetry_task(stack: &'static Stack<'static>) {
         }
 
         Timer::after(Duration::from_millis(100)).await;
+    }
+}
+
+// ========== BLE Tasks ==========
+
+/// BLE controller task - handles HCI communication
+///
+/// This provides low-level HCI access to the BLE controller.
+/// For full GATT peripheral mode, a higher-level library like
+/// `bleps` or `trouble` would be needed on top of this HCI layer.
+#[cfg(feature = "ble")]
+#[embassy_executor::task]
+async fn ble_controller_task(_connector: BleConnector<'static>) {
+    use esp_wifi::ble::{have_hci_read_data, read_hci};
+
+    log::info!("[BLE] Starting BLE controller task");
+    log::info!("[BLE] HCI interface ready");
+    log::info!("[BLE] Note: Full GATT peripheral requires additional library (bleps/trouble)");
+
+    // BLE HCI event loop
+    // In a full implementation, this would:
+    // 1. Send HCI commands to set up advertising
+    // 2. Handle connection events
+    // 3. Process GATT read/write requests
+    //
+    // For now, we just log HCI activity to show the BLE stack is working
+
+    let mut iteration = 0u32;
+    let mut hci_events = 0u32;
+    let mut hci_buffer = [0u8; 256];
+
+    loop {
+        // Check for incoming HCI data
+        if have_hci_read_data() {
+            // Read HCI packet into buffer
+            let len = read_hci(&mut hci_buffer);
+            if len > 0 {
+                hci_events += 1;
+                log::debug!(
+                    "[BLE] HCI packet received: {} bytes, total events: {}",
+                    len,
+                    hci_events
+                );
+            }
+        }
+
+        // Log status periodically
+        iteration += 1;
+        if iteration % 100 == 0 {
+            log::info!("[BLE] Controller running, HCI events: {}", hci_events);
+        }
+
+        // Yield to other tasks
+        Timer::after(Duration::from_millis(10)).await;
     }
 }

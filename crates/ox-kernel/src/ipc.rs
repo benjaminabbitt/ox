@@ -174,26 +174,26 @@ impl<T, const N: usize> Default for InterCoreChannel<T, N> {
 ///
 /// # Usage
 ///
-/// Create the storage in a static, then split into producer/consumer:
+/// Create the storage, then split into producer/consumer:
 ///
 /// ```ignore
-/// #[link_section = ".data"]
-/// static CHANNEL: InterCoreStorage<u32, 8> = InterCoreStorage::new();
+/// static CHANNEL: StaticCell<InterCoreStorage<u32, 8>> = StaticCell::new();
 ///
-/// // On core 0 (producer)
-/// let (mut producer, _) = unsafe { CHANNEL.split() };
+/// // Initialize once at startup
+/// let storage = CHANNEL.init(InterCoreStorage::new());
+/// let (mut producer, mut consumer) = storage.split();
+///
+/// // On core 0 (producer task)
 /// producer.send(42).await;
 ///
-/// // On core 1 (consumer)
-/// let (_, mut consumer) = unsafe { CHANNEL.split() };
+/// // On core 1 (consumer task)
 /// let value = consumer.receive().await;
 /// ```
 ///
-/// # Safety
+/// # Note
 ///
-/// The `split()` method must only be called once. Calling it multiple times
-/// results in undefined behavior as multiple producers or consumers would
-/// exist for the same queue.
+/// The `split()` method borrows mutably, ensuring only one split can exist.
+/// For cross-core use, wrap in a StaticCell and split once during init.
 #[cfg(feature = "esp32s3-dual")]
 pub struct InterCoreStorage<T, const N: usize> {
     queue: heapless::spsc::Queue<T, N>,
@@ -224,7 +224,7 @@ impl<T, const N: usize> InterCoreStorage<T, N> {
     /// Must only be called once. The producer should be used on one core
     /// and the consumer on the other. Using both on the same core is safe
     /// but defeats the purpose.
-    pub unsafe fn split(&self) -> (InterCoreProducer<'_, T, N>, InterCoreConsumer<'_, T, N>) {
+    pub fn split(&mut self) -> (InterCoreProducer<'_, T, N>, InterCoreConsumer<'_, T, N>) {
         let (prod, cons) = self.queue.split();
         (
             InterCoreProducer {
@@ -294,16 +294,16 @@ impl<'a, T, const N: usize> InterCoreProducer<'a, T, N> {
 
     /// Check if the queue is full
     pub fn is_full(&self) -> bool {
-        self.producer.is_full()
+        !self.producer.ready()
     }
 
-    /// Get available capacity
+    /// Get total capacity
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.producer.capacity()
     }
 
-    /// Get number of items ready to be consumed
+    /// Get number of items in the queue
     #[must_use]
     pub fn len(&self) -> usize {
         self.producer.len()
@@ -311,7 +311,7 @@ impl<'a, T, const N: usize> InterCoreProducer<'a, T, N> {
 
     /// Check if queue is empty
     pub fn is_empty(&self) -> bool {
-        self.producer.is_empty()
+        self.producer.len() == 0
     }
 }
 
@@ -357,7 +357,7 @@ impl<'a, T, const N: usize> InterCoreConsumer<'a, T, N> {
 
     /// Check if the queue is empty
     pub fn is_empty(&self) -> bool {
-        self.consumer.is_empty()
+        !self.consumer.ready()
     }
 
     /// Get number of items ready to be consumed
@@ -662,5 +662,123 @@ mod tests {
         let ((resp1, resp2), _) = join(client_future, server_future).await;
         assert_eq!(resp1.result, 8);
         assert_eq!(resp2.result, 28);
+    }
+
+    // ==================== InterCoreStorage Tests (S3 dual-core) ====================
+
+    #[cfg(feature = "esp32s3-dual")]
+    mod inter_core_tests {
+        use super::*;
+
+        #[test]
+        fn inter_core_storage_can_be_created() {
+            let _storage: InterCoreStorage<u32, 4> = InterCoreStorage::new();
+        }
+
+        #[test]
+        fn inter_core_storage_default_works() {
+            let _storage: InterCoreStorage<u32, 4> = InterCoreStorage::default();
+        }
+
+        #[test]
+        fn inter_core_split_returns_producer_consumer() {
+            let mut storage: InterCoreStorage<u32, 4> = InterCoreStorage::new();
+            let (producer, consumer) = storage.split();
+            assert!(producer.is_empty());
+            assert!(consumer.is_empty());
+        }
+
+        #[test]
+        fn inter_core_try_send_receive() {
+            let mut storage: InterCoreStorage<u32, 4> = InterCoreStorage::new();
+            let (mut producer, mut consumer) = storage.split();
+
+            assert!(producer.try_send(42).is_ok());
+            assert!(!consumer.is_empty());
+            assert_eq!(consumer.try_receive(), Some(42));
+            assert!(consumer.is_empty());
+        }
+
+        #[test]
+        fn inter_core_try_send_fails_when_full() {
+            // Note: heapless spsc uses N-1 capacity (one slot reserved)
+            let mut storage: InterCoreStorage<u32, 4> = InterCoreStorage::new();
+            let (mut producer, _consumer) = storage.split();
+
+            assert!(producer.try_send(1).is_ok());
+            assert!(producer.try_send(2).is_ok());
+            assert!(producer.try_send(3).is_ok());
+            assert!(producer.try_send(4).is_err()); // Full (capacity is N-1 = 3)
+            assert!(producer.is_full());
+        }
+
+        #[test]
+        fn inter_core_fifo_order() {
+            let mut storage: InterCoreStorage<u32, 4> = InterCoreStorage::new();
+            let (mut producer, mut consumer) = storage.split();
+
+            producer.try_send(1).unwrap();
+            producer.try_send(2).unwrap();
+            producer.try_send(3).unwrap();
+
+            assert_eq!(consumer.try_receive(), Some(1));
+            assert_eq!(consumer.try_receive(), Some(2));
+            assert_eq!(consumer.try_receive(), Some(3));
+            assert_eq!(consumer.try_receive(), None);
+        }
+
+        #[test]
+        fn inter_core_peek() {
+            let mut storage: InterCoreStorage<u32, 4> = InterCoreStorage::new();
+            let (mut producer, consumer) = storage.split();
+
+            assert_eq!(consumer.peek(), None);
+            producer.try_send(42).unwrap();
+            assert_eq!(consumer.peek(), Some(&42));
+            assert_eq!(consumer.peek(), Some(&42)); // Peek doesn't consume
+        }
+
+        #[test]
+        fn inter_core_len_and_capacity() {
+            // Note: heapless spsc capacity is N-1 (one slot reserved)
+            let mut storage: InterCoreStorage<u32, 4> = InterCoreStorage::new();
+            let (mut producer, consumer) = storage.split();
+
+            assert_eq!(producer.len(), 0);
+            assert_eq!(consumer.len(), 0);
+            // Actual usable capacity is N-1
+            assert_eq!(producer.capacity(), 3);
+            assert_eq!(consumer.capacity(), 3);
+
+            producer.try_send(1).unwrap();
+            producer.try_send(2).unwrap();
+
+            assert_eq!(producer.len(), 2);
+            assert_eq!(consumer.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn inter_core_async_send_receive() {
+            let mut storage: InterCoreStorage<u32, 4> = InterCoreStorage::new();
+            let (mut producer, mut consumer) = storage.split();
+
+            producer.send(100).await;
+            let value = consumer.receive().await;
+            assert_eq!(value, 100);
+        }
+
+        #[tokio::test]
+        async fn inter_core_async_multiple_values() {
+            let mut storage: InterCoreStorage<u32, 8> = InterCoreStorage::new();
+            let (mut producer, mut consumer) = storage.split();
+
+            for i in 0..5 {
+                producer.send(i).await;
+            }
+
+            for i in 0..5 {
+                assert_eq!(consumer.receive().await, i);
+            }
+        }
     }
 }
