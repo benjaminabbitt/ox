@@ -13,5 +13,8 @@ pub mod sensor;
 #[cfg(feature = "wifi")]
 pub mod comms;
 
+#[cfg(feature = "rc")]
+pub mod rc;
+
 #[cfg(feature = "can")]
 pub mod can;

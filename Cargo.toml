@@ -30,6 +30,12 @@ esp-hal-embassy = { version = "0.6", default-features = false, features = ["exec
 esp-backtrace = { version = "0.15", default-features = false }
 esp-println = { version = "0.13", default-features = false, features = ["log", "uart"] }
 
+# WiFi/BLE (feature-gated)
+esp-wifi = { version = "0.15", default-features = false, features = ["builtin-scheduler", "log-04"] }
+esp-alloc = { version = "0.7" }
+embassy-net = { version = "0.7", default-features = false, features = ["tcp", "udp", "dhcpv4", "proto-ipv4"] }
+smoltcp = { version = "0.12", default-features = false }
+
 # Embedded traits
 embedded-hal = "1.0"
 embedded-hal-async = "1.0"

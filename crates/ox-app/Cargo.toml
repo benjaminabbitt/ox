@@ -11,7 +11,8 @@ chip-esp32c3 = ["ox-chip/esp32c3", "esp-hal/esp32c3", "esp-hal-embassy/esp32c3",
 chip-esp32c6 = ["ox-chip/esp32c6", "esp-hal/esp32c6", "esp-hal-embassy/esp32c6", "esp-backtrace/esp32c6", "esp-println/esp32c6", "dual-core"]
 chip-esp32h2 = ["ox-chip/esp32h2", "esp-hal/esp32h2", "esp-hal-embassy/esp32h2", "esp-backtrace/esp32h2", "esp-println/esp32h2"]
 dual-core = ["ox-kernel/dual-core"]
-wifi = ["ox-services/wifi"]
+wifi = ["ox-services/wifi", "dep:esp-wifi", "dep:esp-alloc", "dep:embassy-net", "esp-wifi/wifi", "esp-wifi/esp32c3"]
+ble = ["dep:esp-wifi", "dep:esp-alloc", "esp-wifi/ble", "esp-wifi/esp32c3"]
 
 [dependencies]
 ox-kernel = { path = "../ox-kernel" }
@@ -35,3 +36,8 @@ esp-println.workspace = true
 static_cell.workspace = true
 critical-section.workspace = true
 log.workspace = true
+
+# WiFi/BLE (optional)
+esp-wifi = { workspace = true, optional = true }
+esp-alloc = { workspace = true, optional = true }
+embassy-net = { workspace = true, optional = true }

@@ -7,7 +7,9 @@ description = "Ox microkernel servers - motor, sensor, GPIO, comms"
 
 [features]
 default = []
-wifi = []
+wifi = ["dep:embassy-net", "dep:smoltcp"]
+ble = []
+rc = []  # RC receiver support (SBUS, CRSF, IBUS, PPM)
 can = []
 
 [dependencies]
@@ -18,6 +20,10 @@ embassy-sync.workspace = true
 embassy-time.workspace = true
 heapless.workspace = true
 libm = "0.2"
+
+# WiFi/networking (optional)
+embassy-net = { workspace = true, optional = true }
+smoltcp = { workspace = true, optional = true }
 
 [dev-dependencies]
 ox-hal = { path = "../ox-hal", features = ["mock"] }
