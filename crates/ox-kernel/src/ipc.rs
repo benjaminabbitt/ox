@@ -135,13 +135,14 @@ impl<Req, Resp, const N: usize> Default for Call<Req, Resp, N> {
 /// Inter-core channel for ESP32-C6 dual-core communication
 ///
 /// Uses shared RAM for communication between HP and LP cores.
-#[cfg(feature = "dual-core")]
+/// Note: C6 has heterogeneous cores (HP at 160MHz, LP at 20MHz).
+#[cfg(feature = "esp32c6-dual")]
 pub struct InterCoreChannel<T, const N: usize> {
-    // TODO: Implement using shared memory region
+    // TODO: Implement using shared memory region between HP/LP cores
     inner: Channel<IpcMutex, T, N>,
 }
 
-#[cfg(feature = "dual-core")]
+#[cfg(feature = "esp32c6-dual")]
 impl<T, const N: usize> InterCoreChannel<T, N> {
     pub const fn new() -> Self {
         Self {
@@ -155,6 +156,220 @@ impl<T, const N: usize> InterCoreChannel<T, N> {
 
     pub async fn receive(&self) -> T {
         self.inner.receive().await
+    }
+}
+
+#[cfg(feature = "esp32c6-dual")]
+impl<T, const N: usize> Default for InterCoreChannel<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Symmetric inter-core channel storage for ESP32-S3 dual-core communication
+///
+/// Unlike the C6's heterogeneous HP/LP cores, the S3 has two identical
+/// LX7 cores sharing the same memory space. This enables true lock-free
+/// communication using atomics.
+///
+/// # Usage
+///
+/// Create the storage in a static, then split into producer/consumer:
+///
+/// ```ignore
+/// #[link_section = ".data"]
+/// static CHANNEL: InterCoreStorage<u32, 8> = InterCoreStorage::new();
+///
+/// // On core 0 (producer)
+/// let (mut producer, _) = unsafe { CHANNEL.split() };
+/// producer.send(42).await;
+///
+/// // On core 1 (consumer)
+/// let (_, mut consumer) = unsafe { CHANNEL.split() };
+/// let value = consumer.receive().await;
+/// ```
+///
+/// # Safety
+///
+/// The `split()` method must only be called once. Calling it multiple times
+/// results in undefined behavior as multiple producers or consumers would
+/// exist for the same queue.
+#[cfg(feature = "esp32s3-dual")]
+pub struct InterCoreStorage<T, const N: usize> {
+    queue: heapless::spsc::Queue<T, N>,
+    /// Signal: data is available for consumer
+    data_ready: Signal<IpcMutex, bool>,
+    /// Signal: space is available for producer
+    space_ready: Signal<IpcMutex, bool>,
+}
+
+#[cfg(feature = "esp32s3-dual")]
+impl<T, const N: usize> InterCoreStorage<T, N> {
+    /// Create new inter-core channel storage
+    ///
+    /// Place in a static with `#[link_section = ".data"]` to ensure
+    /// it resides in shared SRAM accessible by both cores.
+    pub const fn new() -> Self {
+        Self {
+            queue: heapless::spsc::Queue::new(),
+            data_ready: Signal::new(),
+            space_ready: Signal::new(),
+        }
+    }
+
+    /// Split storage into producer and consumer handles
+    ///
+    /// # Safety
+    ///
+    /// Must only be called once. The producer should be used on one core
+    /// and the consumer on the other. Using both on the same core is safe
+    /// but defeats the purpose.
+    pub unsafe fn split(&self) -> (InterCoreProducer<'_, T, N>, InterCoreConsumer<'_, T, N>) {
+        let (prod, cons) = self.queue.split();
+        (
+            InterCoreProducer {
+                producer: prod,
+                data_ready: &self.data_ready,
+                space_ready: &self.space_ready,
+            },
+            InterCoreConsumer {
+                consumer: cons,
+                data_ready: &self.data_ready,
+                space_ready: &self.space_ready,
+            },
+        )
+    }
+}
+
+#[cfg(feature = "esp32s3-dual")]
+impl<T, const N: usize> Default for InterCoreStorage<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Producer half of an inter-core channel (runs on one core)
+#[cfg(feature = "esp32s3-dual")]
+pub struct InterCoreProducer<'a, T, const N: usize> {
+    producer: heapless::spsc::Producer<'a, T, N>,
+    data_ready: &'a Signal<IpcMutex, bool>,
+    space_ready: &'a Signal<IpcMutex, bool>,
+}
+
+#[cfg(feature = "esp32s3-dual")]
+impl<'a, T, const N: usize> InterCoreProducer<'a, T, N> {
+    /// Send a value to the consumer core
+    ///
+    /// Blocks if the queue is full until space becomes available.
+    pub async fn send(&mut self, mut value: T) {
+        loop {
+            match self.producer.enqueue(value) {
+                Ok(()) => {
+                    // Signal consumer that data is ready
+                    self.data_ready.signal(true);
+                    return;
+                }
+                Err(v) => {
+                    value = v;
+                    // Queue full - wait for consumer to make space
+                    // Signal uses value semantics, not edge - no race condition
+                    self.space_ready.wait().await;
+                }
+            }
+        }
+    }
+
+    /// Try to send without blocking
+    ///
+    /// Returns `Err(value)` if the queue is full.
+    pub fn try_send(&mut self, value: T) -> Result<(), T> {
+        match self.producer.enqueue(value) {
+            Ok(()) => {
+                self.data_ready.signal(true);
+                Ok(())
+            }
+            Err(v) => Err(v),
+        }
+    }
+
+    /// Check if the queue is full
+    pub fn is_full(&self) -> bool {
+        self.producer.is_full()
+    }
+
+    /// Get available capacity
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.producer.capacity()
+    }
+
+    /// Get number of items ready to be consumed
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.producer.len()
+    }
+
+    /// Check if queue is empty
+    pub fn is_empty(&self) -> bool {
+        self.producer.is_empty()
+    }
+}
+
+/// Consumer half of an inter-core channel (runs on the other core)
+#[cfg(feature = "esp32s3-dual")]
+pub struct InterCoreConsumer<'a, T, const N: usize> {
+    consumer: heapless::spsc::Consumer<'a, T, N>,
+    data_ready: &'a Signal<IpcMutex, bool>,
+    space_ready: &'a Signal<IpcMutex, bool>,
+}
+
+#[cfg(feature = "esp32s3-dual")]
+impl<'a, T, const N: usize> InterCoreConsumer<'a, T, N> {
+    /// Receive a value from the producer core
+    ///
+    /// Blocks until data is available.
+    pub async fn receive(&mut self) -> T {
+        loop {
+            if let Some(value) = self.consumer.dequeue() {
+                // Signal producer that space is available
+                self.space_ready.signal(true);
+                return value;
+            }
+            // Queue empty - wait for producer to send data
+            // Signal uses value semantics, not edge - no race condition
+            self.data_ready.wait().await;
+        }
+    }
+
+    /// Try to receive without blocking
+    pub fn try_receive(&mut self) -> Option<T> {
+        let result = self.consumer.dequeue();
+        if result.is_some() {
+            self.space_ready.signal(true);
+        }
+        result
+    }
+
+    /// Peek at the next value without removing it
+    pub fn peek(&self) -> Option<&T> {
+        self.consumer.peek()
+    }
+
+    /// Check if the queue is empty
+    pub fn is_empty(&self) -> bool {
+        self.consumer.is_empty()
+    }
+
+    /// Get number of items ready to be consumed
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.consumer.len()
+    }
+
+    /// Get total capacity
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.consumer.capacity()
     }
 }
 

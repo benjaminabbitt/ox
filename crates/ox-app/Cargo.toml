@@ -7,13 +7,13 @@ description = "Ox robotics microkernel - main application"
 
 [features]
 default = ["chip-esp32c3"]
-chip-esp32c3 = ["ox-chip/esp32c3", "esp-hal/esp32c3", "esp-hal-embassy/esp32c3", "esp-backtrace/esp32c3", "esp-println/esp32c3"]
-chip-esp32c6 = ["ox-chip/esp32c6", "esp-hal/esp32c6", "esp-hal-embassy/esp32c6", "esp-backtrace/esp32c6", "esp-println/esp32c6", "dual-core"]
-chip-esp32h2 = ["ox-chip/esp32h2", "esp-hal/esp32h2", "esp-hal-embassy/esp32h2", "esp-backtrace/esp32h2", "esp-println/esp32h2"]
+chip-esp32c3 = ["ox-chip/esp32c3", "ox-hal/esp32c3", "esp-hal/esp32c3", "esp-hal-embassy/esp32c3", "esp-backtrace/esp32c3", "esp-println/esp32c3"]
+chip-esp32c6 = ["ox-chip/esp32c6", "ox-hal/esp32c6", "esp-hal/esp32c6", "esp-hal-embassy/esp32c6", "esp-backtrace/esp32c6", "esp-println/esp32c6", "esp32c6-dual"]
+chip-esp32h2 = ["ox-chip/esp32h2", "ox-hal/esp32h2", "esp-hal/esp32h2", "esp-hal-embassy/esp32h2", "esp-backtrace/esp32h2", "esp-println/esp32h2"]
 chip-esp32s3 = ["ox-chip/esp32s3", "ox-hal/esp32s3", "esp-hal/esp32s3", "esp-hal-embassy/esp32s3", "esp-backtrace/esp32s3", "esp-println/esp32s3", "esp32s3-dual"]
+esp32c6-dual = ["ox-kernel/esp32c6-dual"]
 esp32s3-dual = ["ox-kernel/esp32s3-dual"]
 chip-esp32s3-psram = ["chip-esp32s3", "ox-chip/esp32s3-psram", "esp-hal/octal-psram"]
-dual-core = ["ox-kernel/dual-core"]
 
 # WiFi/BLE features (chip-specific)
 # esp-wifi/esp-alloc provides heap allocation symbols and global allocator

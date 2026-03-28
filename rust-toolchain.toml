@@ -1,4 +1,4 @@
 [toolchain]
 channel = "nightly-2026-03-15"
 components = ["rust-src", "llvm-tools", "rustfmt", "clippy"]
-targets = ["riscv32imc-unknown-none-elf", "riscv32imac-unknown-none-elf"]
+targets = ["riscv32imc-unknown-none-elf", "riscv32imac-unknown-none-elf", "xtensa-esp32s3-none-elf"]

@@ -7,8 +7,9 @@ description = "Ox microkernel core - IPC, capabilities, scheduler"
 
 [features]
 default = []
-dual-core = []  # Enable C6 dual-core support
-std = []        # Enable std for host testing
+esp32c6-dual = []    # Enable C6 dual-core support (HP/LP heterogeneous)
+esp32s3-dual = []    # Enable S3 dual-core support (symmetric LX7)
+std = []             # Enable std for host testing
 
 [dependencies]
 embassy-sync.workspace = true

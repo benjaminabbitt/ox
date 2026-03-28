@@ -13,6 +13,9 @@ rustflags = [
     "-C", "force-frame-pointers",
 ]
 
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+
 [env]
 ESP_LOG = "INFO"
 DEFMT_LOG = "trace"

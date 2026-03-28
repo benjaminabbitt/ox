@@ -9,6 +9,17 @@ default: build
 setup:
     ./scripts/setup-tools.sh
 
+# Install Xtensa toolchain for ESP32-S3 (requires espup)
+setup-xtensa:
+    @echo "Installing espup (ESP Rust toolchain manager)..."
+    cargo install espup
+    @echo "Installing Xtensa Rust toolchain..."
+    espup install
+    @echo ""
+    @echo "Done! To use the Xtensa toolchain, run:"
+    @echo "  source $HOME/export-esp.sh"
+    @echo "Then build with: just build-s3"
+
 # ============== Build Commands ==============
 
 # Build for ESP32-C3 (default)
@@ -27,8 +38,19 @@ build-c6:
 build-h2:
     cargo build --release -p ox-app --no-default-features --features chip-esp32h2
 
-# Build all chip variants
+# Build for ESP32-S3 (Xtensa - requires: just setup-xtensa && source ~/export-esp.sh)
+build-s3:
+    cargo build --release -p ox-app --no-default-features --features chip-esp32s3 --target xtensa-esp32s3-none-elf
+
+# Build for ESP32-S3 with PSRAM
+build-s3-psram:
+    cargo build --release -p ox-app --no-default-features --features chip-esp32s3-psram --target xtensa-esp32s3-none-elf
+
+# Build all chip variants (RISC-V only - S3 requires Xtensa toolchain)
 build-all: build build-c6 build-h2
+
+# Build all including S3 (requires Xtensa toolchain)
+build-all-xtensa: build build-c6 build-h2 build-s3
 
 # ============== Flash & Run ==============
 
@@ -43,6 +65,10 @@ run-debug: build-debug
 # Flash ESP32-C6
 run-c6: build-c6
     espflash flash --monitor target/riscv32imc-unknown-none-elf/release/ox-app
+
+# Flash ESP32-S3 (Xtensa)
+run-s3: build-s3
+    espflash flash --monitor target/xtensa-esp32s3-none-elf/release/ox-app
 
 # Just monitor (already flashed)
 monitor:

@@ -3,13 +3,15 @@ name = "ox-chip"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Ox chip-specific implementations (ESP32-C3/C6/H2)"
+description = "Ox chip-specific implementations (ESP32-C3/C6/H2/S3)"
 
 [features]
 default = []
 esp32c3 = ["esp-hal/esp32c3"]
 esp32c6 = ["esp-hal/esp32c6"]
 esp32h2 = ["esp-hal/esp32h2"]
+esp32s3 = ["esp-hal/esp32s3"]
+esp32s3-psram = ["esp32s3", "esp-hal/octal-psram"]
 
 [dependencies]
 esp-hal = { workspace = true, optional = true }
