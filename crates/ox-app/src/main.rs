@@ -1,18 +1,21 @@
-//! Ox Robotics Microkernel - MVP Demo
+//! Ox Robotics Microkernel
 //!
-//! Demonstrates the microkernel architecture with:
-//! - Control loop timing verification (<1ms target)
-//! - GPIO server integration
-//! - Sensor fusion (simulated IMU data)
-//! - Motor control (simulated)
+//! Features:
+//! - 1kHz control loop (<1ms latency)
+//! - Motor and sensor server integration
+//! - WiFi telemetry (feature: wifi) - TODO: version compatibility
+//! - BLE controller input (feature: ble) - TODO
+//! - RC receiver support (feature: rc) - SBUS, CRSF/ELRS
 //!
-//! Wiring (diagram.json):
+//! Wiring:
 //! - GPIO 2: Green LED (status)
 //! - GPIO 3: Red LED (fault indicator)
 //! - GPIO 9: Button (mode switch)
 //! - GPIO 4: I2C SDA (MPU6050)
 //! - GPIO 5: I2C SCL (MPU6050)
 //! - GPIO 6: Servo PWM
+//! - GPIO 20: CRSF RX (when rc feature enabled)
+//! - GPIO 21: CRSF TX (when rc feature enabled)
 
 #![no_std]
 #![no_main]
@@ -33,11 +36,21 @@ use ox_services::sensor::{ImuRaw, SensorServer};
 // HAL mocks for simulation
 use ox_hal::mock::{MockEncoder, MockMotor};
 
+// RC imports
+#[cfg(feature = "rc")]
+use {
+    esp_hal::uart::{Config as UartConfig, Uart, UartRx},
+    ox_services::rc::{CrsfDecoder, RcServer, ChannelMap, FailsafeConfig},
+};
+
 // Control loop timing target
 const CONTROL_PERIOD_US: u64 = 1000; // 1ms = 1kHz
 
 // IPC channels
 static MOTOR_CMD: Channel<CriticalSectionRawMutex, MotorCommand, 4> = Channel::new();
+
+#[cfg(feature = "rc")]
+static RC_MOTOR_CMD: Channel<CriticalSectionRawMutex, MotorCommand, 4> = Channel::new();
 
 // Timing statistics (thread-safe via Mutex)
 static TIMING_STATS: Mutex<CriticalSectionRawMutex, TimingStats> =
@@ -95,10 +108,26 @@ async fn main(spawner: Spawner) {
     esp_println::logger::init_logger_from_env();
 
     log::info!("================================");
-    log::info!("    Ox Microkernel MVP Demo");
+    log::info!("    Ox Robotics Microkernel");
     log::info!("================================");
     log::info!("Chip: {}", ox_chip::CHIP.name);
     log::info!("Target control rate: {} Hz", 1_000_000 / CONTROL_PERIOD_US);
+
+    // Feature flags
+    #[cfg(feature = "wifi")]
+    log::info!("WiFi: ENABLED (not yet implemented)");
+    #[cfg(not(feature = "wifi"))]
+    log::info!("WiFi: disabled");
+
+    #[cfg(feature = "ble")]
+    log::info!("BLE: ENABLED (not yet implemented)");
+    #[cfg(not(feature = "ble"))]
+    log::info!("BLE: disabled");
+
+    #[cfg(feature = "rc")]
+    log::info!("RC: ENABLED (CRSF on GPIO20/21)");
+    #[cfg(not(feature = "rc"))]
+    log::info!("RC: disabled");
 
     // ========== GPIO Setup ==========
     let led_green = Output::new(peripherals.GPIO2, Level::Low);
@@ -108,7 +137,28 @@ async fn main(spawner: Spawner) {
     log::info!("[GPIO] Status LED on GPIO2, Fault LED on GPIO3");
     log::info!("[GPIO] Mode button on GPIO9");
 
-    // ========== Spawn Tasks ==========
+    // ========== CRSF/RC Setup ==========
+    #[cfg(feature = "rc")]
+    {
+        log::info!("[RC] Initializing CRSF receiver on UART...");
+
+        // CRSF uses 420000 baud
+        let uart_config = UartConfig::default().with_baudrate(420_000);
+
+        let uart = Uart::new(peripherals.UART1, uart_config)
+            .unwrap()
+            .with_rx(peripherals.GPIO20)
+            .with_tx(peripherals.GPIO21)
+            .into_async();
+
+        // We only need the RX part for receiving CRSF
+        let (rx, _tx) = uart.split();
+
+        spawner.spawn(crsf_receiver_task(rx)).unwrap();
+        log::info!("[RC] CRSF receiver task spawned");
+    }
+
+    // ========== Core Tasks ==========
     spawner.spawn(control_loop_task()).unwrap();
     spawner.spawn(status_led_task(led_green)).unwrap();
     spawner.spawn(fault_led_task(led_red)).unwrap();
@@ -118,7 +168,7 @@ async fn main(spawner: Spawner) {
     log::info!("All tasks spawned");
     log::info!("================================");
     log::info!("Press button to cycle control modes:");
-    log::info!("  Coast -> Velocity -> Position -> Coast");
+    log::info!("  Coast -> Velocity -> Position -> E-Stop");
     log::info!("================================");
 
     // Main supervisor loop
@@ -129,11 +179,6 @@ async fn main(spawner: Spawner) {
 }
 
 /// Control loop task - runs motor and sensor servers at 1kHz
-///
-/// This is the heart of the microkernel - demonstrating:
-/// - Precise timing control
-/// - Server integration (motor, sensor)
-/// - IPC command processing
 #[embassy_executor::task]
 async fn control_loop_task() {
     log::info!("[CTRL] Starting 1kHz control loop");
@@ -162,19 +207,25 @@ async fn control_loop_task() {
     loop {
         let start = Instant::now();
 
-        // 1. Process any pending commands
+        // 1. Process button commands
         if let Ok(cmd) = MOTOR_CMD.try_receive() {
-            log::info!("[CTRL] Command: {:?}", cmd);
+            log::info!("[CTRL] Button command: {:?}", cmd);
             motor_server.process_command(cmd);
         }
 
-        // 2. Process sensor data
+        // 2. Process RC commands (higher priority)
+        #[cfg(feature = "rc")]
+        if let Ok(cmd) = RC_MOTOR_CMD.try_receive() {
+            motor_server.process_command(cmd);
+        }
+
+        // 3. Process sensor data
         let _imu = sensor_server.process_imu(imu_raw, dt);
 
-        // 3. Run motor control loop
+        // 4. Run motor control loop
         motor_server.update(dt);
 
-        // 4. Record timing
+        // 5. Record timing
         let elapsed_us = start.elapsed().as_micros() as u64;
         {
             let mut stats = TIMING_STATS.lock().await;
@@ -200,6 +251,75 @@ async fn control_loop_task() {
         }
     }
 }
+
+// ========== CRSF/RC Task ==========
+
+#[cfg(feature = "rc")]
+#[embassy_executor::task]
+async fn crsf_receiver_task(mut rx: UartRx<'static, esp_hal::Async>) {
+    use embedded_io_async::Read;
+
+    log::info!("[CRSF] Starting CRSF receiver task");
+
+    let mut decoder = CrsfDecoder::new();
+    let mut rc_server = RcServer::new(ChannelMap::default(), FailsafeConfig::default());
+
+    let mut buf = [0u8; 1];
+    let mut last_update = Instant::now();
+
+    loop {
+        // Read one byte at a time (CRSF is byte-oriented)
+        match rx.read(&mut buf).await {
+            Ok(_) => {
+                if let Some(channels) = decoder.decode(buf[0]) {
+                    rc_server.process(&channels);
+
+                    // Convert RC to motor command
+                    let throttle = rc_server.throttle();
+                    let steering = rc_server.steering();
+
+                    // Skip if in failsafe
+                    if !rc_server.is_failsafe() {
+                        // Differential mixing
+                        let left = ((throttle + steering) * 1000.0) as i16;
+                        let right = ((throttle - steering) * 1000.0) as i16;
+
+                        let cmd = if rc_server.is_armed() {
+                            MotorCommand::SetVelocity { left, right }
+                        } else {
+                            MotorCommand::Coast
+                        };
+
+                        let _ = RC_MOTOR_CMD.try_send(cmd);
+                    }
+
+                    // Log occasionally
+                    if decoder.link_quality() > 0 {
+                        log::debug!(
+                            "[CRSF] T:{:.2} S:{:.2} LQ:{} RSSI:{}",
+                            throttle,
+                            steering,
+                            decoder.link_quality(),
+                            decoder.rssi()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("[CRSF] UART error: {:?}", e);
+                Timer::after(Duration::from_millis(10)).await;
+            }
+        }
+
+        // Update failsafe timer
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_update).as_millis() as u32;
+        rc_server.update(elapsed);
+        last_update = now;
+    }
+}
+
+// ========== LED and Button Tasks ==========
 
 /// Status LED task - indicates control mode
 #[embassy_executor::task]
