@@ -1,0 +1,19 @@
+[package]
+name = "ox-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ox hardware abstraction layer - mockable HAL traits"
+
+[features]
+default = []
+std = []        # Enable std for host testing
+mock = []       # Enable mock implementations
+
+[dependencies]
+embedded-hal.workspace = true
+embedded-hal-async.workspace = true
+defmt = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true

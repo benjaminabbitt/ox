@@ -1,0 +1,22 @@
+[package]
+name = "ox-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ox microkernel servers - motor, sensor, GPIO, comms"
+
+[features]
+default = []
+wifi = []
+can = []
+
+[dependencies]
+ox-kernel = { path = "../ox-kernel" }
+ox-hal = { path = "../ox-hal" }
+ox-control = { path = "../ox-control" }
+embassy-sync.workspace = true
+embassy-time.workspace = true
+heapless.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

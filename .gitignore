@@ -1,0 +1,26 @@
+# Build artifacts
+/target/
+
+# Cargo lock for libraries (keep for binaries)
+# Cargo.lock
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local tool configs
+.claude/
+.gemini/
+.scm/memory/
+.mcp.json
+.mcp.json.scm.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ESP tools
+.espressif/

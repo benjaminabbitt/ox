@@ -1,0 +1,37 @@
+[package]
+name = "ox-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ox robotics microkernel - main application"
+
+[features]
+default = ["chip-esp32c3"]
+chip-esp32c3 = ["ox-chip/esp32c3", "esp-hal/esp32c3", "esp-hal-embassy/esp32c3", "esp-backtrace/esp32c3", "esp-println/esp32c3"]
+chip-esp32c6 = ["ox-chip/esp32c6", "esp-hal/esp32c6", "esp-hal-embassy/esp32c6", "esp-backtrace/esp32c6", "esp-println/esp32c6", "dual-core"]
+chip-esp32h2 = ["ox-chip/esp32h2", "esp-hal/esp32h2", "esp-hal-embassy/esp32h2", "esp-backtrace/esp32h2", "esp-println/esp32h2"]
+dual-core = ["ox-kernel/dual-core"]
+wifi = ["ox-services/wifi"]
+
+[dependencies]
+ox-kernel = { path = "../ox-kernel" }
+ox-hal = { path = "../ox-hal" }
+ox-chip = { path = "../ox-chip" }
+ox-control = { path = "../ox-control" }
+ox-services = { path = "../ox-services" }
+
+# Embassy
+embassy-executor = { workspace = true, features = ["task-arena-size-32768"] }
+embassy-time.workspace = true
+embassy-sync.workspace = true
+
+# ESP HAL
+esp-hal.workspace = true
+esp-hal-embassy.workspace = true
+esp-backtrace = { workspace = true, features = ["exception-handler", "panic-handler", "println"] }
+esp-println.workspace = true
+
+# Utilities
+static_cell.workspace = true
+critical-section.workspace = true
+log.workspace = true

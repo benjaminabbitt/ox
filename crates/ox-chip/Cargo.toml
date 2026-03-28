@@ -1,0 +1,16 @@
+[package]
+name = "ox-chip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ox chip-specific implementations (ESP32-C3/C6/H2)"
+
+[features]
+default = []
+esp32c3 = ["esp-hal/esp32c3"]
+esp32c6 = ["esp-hal/esp32c6"]
+esp32h2 = ["esp-hal/esp32h2"]
+
+[dependencies]
+esp-hal = { workspace = true, optional = true }
+esp-hal-embassy = { workspace = true, optional = true }

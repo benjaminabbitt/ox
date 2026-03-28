@@ -1,0 +1,152 @@
+//! PID Controller implementation
+//!
+//! A general-purpose PID controller with:
+//! - Anti-windup
+//! - Derivative filtering
+//! - Output limiting
+
+/// PID Controller
+pub struct PidController {
+    // Gains
+    kp: f32,
+    ki: f32,
+    kd: f32,
+
+    // State
+    integral: f32,
+    prev_error: f32,
+    prev_measurement: f32, // For derivative-on-measurement
+
+    // Limits
+    output_min: f32,
+    output_max: f32,
+    integral_min: f32,
+    integral_max: f32,
+
+    // Configuration
+    use_derivative_on_measurement: bool,
+}
+
+impl PidController {
+    /// Create a new PID controller with the given gains
+    pub fn new(kp: f32, ki: f32, kd: f32) -> Self {
+        Self {
+            kp,
+            ki,
+            kd,
+            integral: 0.0,
+            prev_error: 0.0,
+            prev_measurement: 0.0,
+            output_min: -1.0,
+            output_max: 1.0,
+            integral_min: -1.0,
+            integral_max: 1.0,
+            use_derivative_on_measurement: true,
+        }
+    }
+
+    /// Set output limits
+    pub fn set_output_limits(&mut self, min: f32, max: f32) {
+        self.output_min = min;
+        self.output_max = max;
+    }
+
+    /// Set integral limits (anti-windup)
+    pub fn set_integral_limits(&mut self, min: f32, max: f32) {
+        self.integral_min = min;
+        self.integral_max = max;
+    }
+
+    /// Update the PID controller
+    ///
+    /// # Arguments
+    /// * `setpoint` - Desired value
+    /// * `measurement` - Current measured value
+    /// * `dt` - Time step in seconds
+    ///
+    /// # Returns
+    /// Control output (clamped to output limits)
+    pub fn update(&mut self, setpoint: f32, measurement: f32, dt: f32) -> f32 {
+        let error = setpoint - measurement;
+
+        // Proportional term
+        let p_term = self.kp * error;
+
+        // Integral term with anti-windup
+        self.integral += error * dt;
+        self.integral = self.integral.clamp(self.integral_min, self.integral_max);
+        let i_term = self.ki * self.integral;
+
+        // Derivative term (on measurement to avoid derivative kick)
+        let d_term = if self.use_derivative_on_measurement {
+            let d_measurement = (measurement - self.prev_measurement) / dt;
+            -self.kd * d_measurement
+        } else {
+            let d_error = (error - self.prev_error) / dt;
+            self.kd * d_error
+        };
+
+        // Save state for next iteration
+        self.prev_error = error;
+        self.prev_measurement = measurement;
+
+        // Calculate and clamp output
+        let output = p_term + i_term + d_term;
+        output.clamp(self.output_min, self.output_max)
+    }
+
+    /// Reset the controller state
+    pub fn reset(&mut self) {
+        self.integral = 0.0;
+        self.prev_error = 0.0;
+        self.prev_measurement = 0.0;
+    }
+
+    /// Get current integral value (for debugging)
+    pub fn integral(&self) -> f32 {
+        self.integral
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_responds_to_positive_error() {
+        let mut pid = PidController::new(1.0, 0.0, 0.0);
+        let output = pid.update(100.0, 50.0, 0.001);
+        assert!(output > 0.0, "Output should be positive for positive error");
+    }
+
+    #[test]
+    fn pid_responds_to_negative_error() {
+        let mut pid = PidController::new(1.0, 0.0, 0.0);
+        let output = pid.update(50.0, 100.0, 0.001);
+        assert!(output < 0.0, "Output should be negative for negative error");
+    }
+
+    #[test]
+    fn pid_output_is_bounded() {
+        let mut pid = PidController::new(100.0, 0.0, 0.0);
+        pid.set_output_limits(-1.0, 1.0);
+        let output = pid.update(1000.0, 0.0, 0.001);
+        assert!(output >= -1.0 && output <= 1.0, "Output should be clamped");
+    }
+
+    #[test]
+    fn pid_integral_accumulates() {
+        let mut pid = PidController::new(0.0, 1.0, 0.0);
+        pid.update(1.0, 0.0, 0.1);
+        pid.update(1.0, 0.0, 0.1);
+        assert!(pid.integral() > 0.0, "Integral should accumulate");
+    }
+
+    #[test]
+    fn pid_reset_clears_state() {
+        let mut pid = PidController::new(1.0, 1.0, 1.0);
+        pid.update(100.0, 0.0, 0.1);
+        pid.reset();
+        assert_eq!(pid.integral(), 0.0);
+    }
+}

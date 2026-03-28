@@ -1,0 +1,16 @@
+[package]
+name = "ox-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ox test harness and utilities"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+ox-kernel = { path = "../ox-kernel" }
+ox-hal = { path = "../ox-hal", features = ["mock"] }
+ox-control = { path = "../ox-control" }
+proptest.workspace = true

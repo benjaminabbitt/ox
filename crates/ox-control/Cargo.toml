@@ -1,0 +1,17 @@
+[package]
+name = "ox-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ox control algorithms - PID, filters, state estimation"
+
+[features]
+default = []
+std = []
+
+[dependencies]
+# fixed.workspace = true  # Temporarily disabled
+libm = "0.2"
+
+[dev-dependencies]
+proptest.workspace = true

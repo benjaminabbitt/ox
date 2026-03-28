@@ -1,0 +1,24 @@
+[package]
+name = "ox-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ox microkernel core - IPC, capabilities, scheduler"
+
+[features]
+default = []
+dual-core = []  # Enable C6 dual-core support
+std = []        # Enable std for host testing
+
+[dependencies]
+embassy-sync.workspace = true
+embassy-time.workspace = true
+embassy-executor = { workspace = true, optional = true }
+critical-section.workspace = true
+heapless.workspace = true
+static_cell.workspace = true
+defmt = { workspace = true, optional = true }
+portable-atomic = { version = "1.6", default-features = false }
+
+[dev-dependencies]
+proptest.workspace = true

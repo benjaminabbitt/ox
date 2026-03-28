@@ -1,0 +1,11 @@
+[wokwi]
+version = 1
+elf = "target/riscv32imc-unknown-none-elf/release/ox-app"
+firmware = "target/riscv32imc-unknown-none-elf/release/ox-app"
+
+# GDB debugging (optional)
+# gdb = true
+# gdb_port = 3333
+
+# Simulation timeout (ms) - 0 for infinite
+timeout = 0
