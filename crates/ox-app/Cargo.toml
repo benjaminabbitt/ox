@@ -10,9 +10,17 @@ default = ["chip-esp32c3"]
 chip-esp32c3 = ["ox-chip/esp32c3", "esp-hal/esp32c3", "esp-hal-embassy/esp32c3", "esp-backtrace/esp32c3", "esp-println/esp32c3"]
 chip-esp32c6 = ["ox-chip/esp32c6", "esp-hal/esp32c6", "esp-hal-embassy/esp32c6", "esp-backtrace/esp32c6", "esp-println/esp32c6", "dual-core"]
 chip-esp32h2 = ["ox-chip/esp32h2", "esp-hal/esp32h2", "esp-hal-embassy/esp32h2", "esp-backtrace/esp32h2", "esp-println/esp32h2"]
+chip-esp32s3 = ["ox-chip/esp32s3", "ox-hal/esp32s3", "esp-hal/esp32s3", "esp-hal-embassy/esp32s3", "esp-backtrace/esp32s3", "esp-println/esp32s3", "esp32s3-dual"]
+esp32s3-dual = ["ox-kernel/esp32s3-dual"]
+chip-esp32s3-psram = ["chip-esp32s3", "ox-chip/esp32s3-psram", "esp-hal/octal-psram"]
 dual-core = ["ox-kernel/dual-core"]
-wifi = ["ox-services/wifi", "dep:esp-wifi", "dep:esp-alloc", "dep:embassy-net", "dep:smoltcp", "esp-wifi/wifi", "esp-wifi/esp32c3"]
-ble = ["dep:esp-wifi", "dep:esp-alloc", "esp-wifi/ble", "esp-wifi/esp32c3"]
+
+# WiFi/BLE features (chip-specific)
+# esp-wifi/esp-alloc provides heap allocation symbols and global allocator
+wifi = ["ox-services/wifi", "dep:esp-wifi", "dep:embassy-net", "dep:smoltcp", "esp-wifi/wifi", "esp-wifi/esp32c3", "esp-wifi/esp-alloc"]
+ble = ["dep:esp-wifi", "esp-wifi/ble", "esp-wifi/esp32c3", "esp-wifi/esp-alloc"]
+wifi-s3 = ["ox-services/wifi", "dep:esp-wifi", "dep:embassy-net", "dep:smoltcp", "esp-wifi/wifi", "esp-wifi/esp32s3", "esp-wifi/esp-alloc"]
+ble-s3 = ["dep:esp-wifi", "esp-wifi/ble", "esp-wifi/esp32s3", "esp-wifi/esp-alloc"]
 rc = ["ox-services/rc"]  # RC receiver (SBUS, CRSF)
 
 [dependencies]
@@ -40,8 +48,7 @@ log.workspace = true
 heapless.workspace = true
 embedded-io-async = "0.6"
 
-# WiFi/BLE (optional)
+# WiFi/BLE (optional) - esp-alloc is pulled in via esp-wifi/esp-alloc feature
 esp-wifi = { workspace = true, optional = true }
-esp-alloc = { workspace = true, optional = true }
 embassy-net = { workspace = true, optional = true }
 smoltcp = { workspace = true, optional = true, features = ["proto-ipv4", "socket-tcp", "socket-udp"] }

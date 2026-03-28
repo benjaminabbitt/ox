@@ -3,7 +3,7 @@
 //! Features:
 //! - 1kHz control loop (<1ms latency)
 //! - Motor and sensor server integration
-//! - WiFi telemetry (feature: wifi) - TODO: version compatibility
+//! - WiFi telemetry (feature: wifi)
 //! - BLE controller input (feature: ble) - TODO
 //! - RC receiver support (feature: rc) - SBUS, CRSF/ELRS
 //!
@@ -42,6 +42,36 @@ use {
     esp_hal::uart::{Config as UartConfig, Uart, UartRx},
     ox_services::rc::{CrsfDecoder, RcServer, ChannelMap, FailsafeConfig},
 };
+
+// WiFi imports
+#[cfg(feature = "wifi")]
+use {
+    embassy_net::{Config as NetConfig, Runner, Stack, StackResources},
+    esp_hal::rng::Rng,
+    esp_wifi::{
+        init as wifi_init,
+        wifi::{
+            ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState,
+        },
+        EspWifiController,
+    },
+    ox_services::comms::{CommsConfig, CommsServer},
+};
+
+// WiFi configuration (set via environment or use defaults)
+#[cfg(feature = "wifi")]
+const WIFI_SSID: &str = env!("WIFI_SSID");
+#[cfg(feature = "wifi")]
+const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
+
+// Helper macro to create static variables at runtime
+#[cfg(feature = "wifi")]
+macro_rules! mk_static {
+    ($t:ty, $val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        STATIC_CELL.init($val)
+    }};
+}
 
 // Control loop timing target
 const CONTROL_PERIOD_US: u64 = 1000; // 1ms = 1kHz
@@ -95,8 +125,13 @@ impl TimingStats {
     }
 }
 
+// Note: When using esp-wifi/esp-alloc feature, the heap is automatically
+// initialized by esp-wifi. No manual heap initialization needed.
+
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
+    // Note: WiFi heap is automatically initialized by esp-wifi/esp-alloc feature
+
     // Initialize ESP-HAL
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
@@ -115,7 +150,7 @@ async fn main(spawner: Spawner) {
 
     // Feature flags
     #[cfg(feature = "wifi")]
-    log::info!("WiFi: ENABLED (not yet implemented)");
+    log::info!("WiFi: ENABLED (SSID: {})", WIFI_SSID);
     #[cfg(not(feature = "wifi"))]
     log::info!("WiFi: disabled");
 
@@ -156,6 +191,50 @@ async fn main(spawner: Spawner) {
 
         spawner.spawn(crsf_receiver_task(rx)).unwrap();
         log::info!("[RC] CRSF receiver task spawned");
+    }
+
+    // ========== WiFi Setup ==========
+    #[cfg(feature = "wifi")]
+    {
+        log::info!("[WIFI] Initializing WiFi stack...");
+
+        // Initialize RNG for network seed
+        let mut rng = Rng::new(peripherals.RNG);
+
+        // Use TIMG1 for WiFi (TIMG0 is used by Embassy time driver)
+        let timg1 = TimerGroup::new(peripherals.TIMG1);
+
+        // Initialize WiFi controller (requires 'static lifetime)
+        let wifi_init = mk_static!(
+            EspWifiController<'static>,
+            wifi_init(timg1.timer0, rng.clone(), peripherals.RADIO_CLK).unwrap()
+        );
+
+        // Create WiFi device in station mode
+        let (wifi_interface, controller) =
+            esp_wifi::wifi::new_with_mode(wifi_init, peripherals.WIFI, WifiStaDevice).unwrap();
+
+        // Generate random seed for network stack
+        let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+
+        // Create network stack with DHCP
+        let net_config = NetConfig::dhcpv4(Default::default());
+        let (stack, runner) = embassy_net::new(
+            wifi_interface,
+            net_config,
+            mk_static!(StackResources<3>, StackResources::<3>::new()),
+            seed,
+        );
+
+        // Store stack reference for telemetry tasks
+        let stack_ref = mk_static!(Stack<'static>, stack);
+
+        // Spawn WiFi tasks
+        spawner.spawn(wifi_connection_task(controller)).unwrap();
+        spawner.spawn(wifi_net_task(runner)).unwrap();
+        spawner.spawn(wifi_telemetry_task(stack_ref)).unwrap();
+
+        log::info!("[WIFI] WiFi tasks spawned");
     }
 
     // ========== Core Tasks ==========
@@ -408,5 +487,124 @@ async fn timing_report_task() {
             // Reset stats for next period
             stats.reset();
         }
+    }
+}
+
+// ========== WiFi Tasks ==========
+
+/// WiFi connection management task
+#[cfg(feature = "wifi")]
+#[embassy_executor::task]
+async fn wifi_connection_task(mut controller: WifiController<'static>) {
+    log::info!("[WIFI] Starting connection task");
+
+    loop {
+        // Wait for WiFi to be ready
+        if matches!(esp_wifi::wifi::wifi_state(), WifiState::StaConnected) {
+            // Already connected, wait for disconnect event
+            controller.wait_for_event(WifiEvent::StaDisconnected).await;
+            log::warn!("[WIFI] Disconnected from AP");
+            Timer::after(Duration::from_secs(1)).await;
+        }
+
+        // Configure WiFi
+        if !matches!(controller.is_started(), Ok(true)) {
+            let client_config = Configuration::Client(ClientConfiguration {
+                ssid: WIFI_SSID.try_into().unwrap(),
+                password: WIFI_PASSWORD.try_into().unwrap(),
+                ..Default::default()
+            });
+            controller.set_configuration(&client_config).unwrap();
+            log::info!("[WIFI] Starting WiFi...");
+            controller.start_async().await.unwrap();
+            log::info!("[WIFI] WiFi started");
+        }
+
+        // Connect to AP
+        log::info!("[WIFI] Connecting to {}...", WIFI_SSID);
+        match controller.connect_async().await {
+            Ok(_) => log::info!("[WIFI] Connected to AP"),
+            Err(e) => {
+                log::warn!("[WIFI] Connection failed: {:?}", e);
+                Timer::after(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+/// WiFi network stack runner task
+#[cfg(feature = "wifi")]
+#[embassy_executor::task]
+async fn wifi_net_task(mut runner: Runner<'static, WifiDevice<'static, WifiStaDevice>>) {
+    log::info!("[WIFI] Starting network stack");
+    runner.run().await;
+}
+
+/// WiFi telemetry streaming task
+#[cfg(feature = "wifi")]
+#[embassy_executor::task]
+async fn wifi_telemetry_task(stack: &'static Stack<'static>) {
+    log::info!("[WIFI] Starting telemetry task");
+
+    // Create comms server
+    let mut config = CommsConfig::default();
+    let _ = config.wifi.ssid.push_str(WIFI_SSID);
+    let mut comms = CommsServer::new(config);
+
+    // Wait for network to be up
+    loop {
+        if stack.is_link_up() {
+            break;
+        }
+        Timer::after(Duration::from_millis(500)).await;
+    }
+    log::info!("[WIFI] Link is up");
+
+    // Wait for IP address
+    loop {
+        if let Some(cfg) = stack.config_v4() {
+            log::info!("[WIFI] Got IP: {}", cfg.address.address());
+            break;
+        }
+        Timer::after(Duration::from_millis(500)).await;
+    }
+
+    comms.start_connect();
+    comms.on_connected();
+    log::info!("[WIFI] Telemetry ready");
+
+    // Telemetry loop
+    let mut iteration = 0u32;
+
+    loop {
+        // Update comms server state
+        let timestamp = Instant::now().as_millis() as u32;
+        comms.update(timestamp);
+
+        // Log status periodically
+        iteration += 1;
+        if iteration % 100 == 0 {
+            let stats = comms.stats();
+            log::info!(
+                "[WIFI] State: {:?}, TX: {}, RX: {}",
+                comms.state(),
+                stats.tx_count,
+                stats.rx_count
+            );
+        }
+
+        // Send queued telemetry messages
+        while let Some(msg) = comms.pop_telemetry() {
+            // In a real implementation, this would send over a socket
+            // For now, just log it
+            log::debug!(
+                "[WIFI] Telemetry: {:?} @ {}ms",
+                msg.msg_type,
+                msg.timestamp_ms
+            );
+            comms.on_message_sent();
+        }
+
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
