@@ -1109,6 +1109,7 @@ dependencies = [
  "embassy-sync 0.7.2",
  "embassy-time",
  "heapless",
+ "libm",
  "ox-control",
  "ox-hal",
  "ox-kernel",

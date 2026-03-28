@@ -17,6 +17,8 @@ ox-control = { path = "../ox-control" }
 embassy-sync.workspace = true
 embassy-time.workspace = true
 heapless.workspace = true
+libm = "0.2"
 
 [dev-dependencies]
+ox-hal = { path = "../ox-hal", features = ["mock"] }
 proptest.workspace = true
