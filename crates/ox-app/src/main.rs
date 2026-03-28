@@ -199,26 +199,38 @@ async fn main(spawner: Spawner) {
         log::info!("[RC] CRSF receiver task spawned");
     }
 
+    // ========== Radio Setup (WiFi/BLE shared) ==========
+    // ESP32 supports WiFi+BLE coexistence via time-multiplexing
+    #[cfg(any(feature = "wifi", feature = "ble"))]
+    let (radio_controller, mut rng) = {
+        log::info!("[RADIO] Initializing shared radio controller...");
+
+        // Initialize RNG (needed for both WiFi and BLE)
+        let rng = Rng::new(peripherals.RNG);
+
+        // Use TIMG1 for radio (TIMG0 is used by Embassy time driver)
+        let timg1 = TimerGroup::new(peripherals.TIMG1);
+
+        // Initialize shared radio controller (supports WiFi + BLE coexistence)
+        let init = mk_static!(
+            EspWifiController<'static>,
+            wifi_init(timg1.timer0, rng.clone(), peripherals.RADIO_CLK).unwrap()
+        );
+
+        #[cfg(all(feature = "wifi", feature = "ble"))]
+        log::info!("[RADIO] WiFi + BLE coexistence enabled");
+
+        (init, rng)
+    };
+
     // ========== WiFi Setup ==========
     #[cfg(feature = "wifi")]
     {
         log::info!("[WIFI] Initializing WiFi stack...");
 
-        // Initialize RNG for network seed
-        let mut rng = Rng::new(peripherals.RNG);
-
-        // Use TIMG1 for WiFi (TIMG0 is used by Embassy time driver)
-        let timg1 = TimerGroup::new(peripherals.TIMG1);
-
-        // Initialize WiFi controller (requires 'static lifetime)
-        let wifi_init = mk_static!(
-            EspWifiController<'static>,
-            wifi_init(timg1.timer0, rng.clone(), peripherals.RADIO_CLK).unwrap()
-        );
-
         // Create WiFi device in station mode
         let (wifi_interface, controller) =
-            esp_wifi::wifi::new_with_mode(wifi_init, peripherals.WIFI, WifiStaDevice).unwrap();
+            esp_wifi::wifi::new_with_mode(radio_controller, peripherals.WIFI, WifiStaDevice).unwrap();
 
         // Generate random seed for network stack
         let seed = (rng.random() as u64) << 32 | rng.random() as u64;
@@ -244,30 +256,20 @@ async fn main(spawner: Spawner) {
     }
 
     // ========== BLE Setup ==========
-    // Note: BLE-only mode (when wifi feature is disabled)
-    // WiFi and BLE can coexist but require shared radio initialization
-    #[cfg(all(feature = "ble", not(feature = "wifi")))]
+    #[cfg(feature = "ble")]
     {
         log::info!("[BLE] Initializing BLE controller...");
 
-        // Initialize RNG
-        let rng = Rng::new(peripherals.RNG);
-
-        // Use TIMG1 for BLE (TIMG0 is used by Embassy time driver)
-        let timg1 = TimerGroup::new(peripherals.TIMG1);
-
-        // Initialize BLE controller (shares radio with WiFi when both enabled)
-        let ble_init = mk_static!(
-            EspWifiController<'static>,
-            wifi_init(timg1.timer0, rng, peripherals.RADIO_CLK).unwrap()
-        );
-
-        // Create BLE connector (HCI interface)
-        let connector = BleConnector::new(ble_init, peripherals.BT);
+        // Create BLE connector (HCI interface) - shares radio with WiFi
+        let connector = BleConnector::new(radio_controller, peripherals.BT);
 
         spawner.spawn(ble_controller_task(connector)).unwrap();
         log::info!("[BLE] BLE controller task spawned");
     }
+
+    // Suppress unused variable warning when only one feature is enabled
+    #[cfg(all(any(feature = "wifi", feature = "ble"), not(all(feature = "wifi", feature = "ble"))))]
+    let _ = rng;
 
     // ========== Core Tasks ==========
     spawner.spawn(control_loop_task()).unwrap();
