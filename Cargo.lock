@@ -1080,7 +1080,9 @@ dependencies = [
  "defmt 0.3.100",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
+ "esp-hal",
  "proptest",
+ "tokio",
 ]
 
 [[package]]

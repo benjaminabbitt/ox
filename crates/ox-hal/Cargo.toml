@@ -10,10 +10,17 @@ default = []
 std = []        # Enable std for host testing
 mock = []       # Enable mock implementations
 
+# ESP32 chip features (enables real HAL implementations)
+esp32c3 = ["dep:esp-hal", "esp-hal/esp32c3"]
+esp32c6 = ["dep:esp-hal", "esp-hal/esp32c6"]
+esp32h2 = ["dep:esp-hal", "esp-hal/esp32h2"]
+
 [dependencies]
 embedded-hal.workspace = true
 embedded-hal-async.workspace = true
 defmt = { workspace = true, optional = true }
+esp-hal = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
+tokio = { version = "1", features = ["rt", "macros"] }
