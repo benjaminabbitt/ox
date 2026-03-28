@@ -70,6 +70,10 @@ run-c6: build-c6
 run-s3: build-s3
     espflash flash --monitor target/xtensa-esp32s3-none-elf/release/ox-app
 
+# Flash ESP32-S3 with PSRAM
+run-s3-psram: build-s3-psram
+    espflash flash --monitor target/xtensa-esp32s3-none-elf/release/ox-app
+
 # Just monitor (already flashed)
 monitor:
     espflash monitor
