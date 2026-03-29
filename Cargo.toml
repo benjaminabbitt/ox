@@ -8,6 +8,8 @@ members = [
     "crates/ox-services",
     "crates/ox-test",
     "crates/ox-app",
+    "crates/ox-sketch",
+    "crates/ox-sketch-macros",
 ]
 
 [workspace.package]
