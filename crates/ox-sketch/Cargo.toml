@@ -1,0 +1,39 @@
+[package]
+name = "ox-sketch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Arduino-like simplicity for Rust robotics on ESP32"
+
+[features]
+default = ["chip-esp32c3"]
+chip-esp32c3 = ["esp-hal/esp32c3", "esp-hal-embassy/esp32c3", "esp-backtrace/esp32c3", "esp-println/esp32c3"]
+chip-esp32c6 = ["esp-hal/esp32c6", "esp-hal-embassy/esp32c6", "esp-backtrace/esp32c6", "esp-println/esp32c6"]
+chip-esp32s3 = ["esp-hal/esp32s3", "esp-hal-embassy/esp32s3", "esp-backtrace/esp32s3", "esp-println/esp32s3"]
+
+# Robotics features
+rc = ["dep:ox-services", "ox-services/rc"]
+motor = []
+pwm = []
+
+[dependencies]
+ox-sketch-macros = { path = "../ox-sketch-macros" }
+
+# Embassy
+embassy-executor = { workspace = true, features = ["task-arena-size-32768"] }
+embassy-time.workspace = true
+embassy-sync.workspace = true
+
+# ESP HAL
+esp-hal.workspace = true
+esp-hal-embassy.workspace = true
+esp-backtrace = { workspace = true, features = ["exception-handler", "panic-handler", "println"] }
+esp-println.workspace = true
+
+# Utilities
+defmt.workspace = true
+embedded-io-async = "0.6"
+fugit = "0.3"
+
+# Optional robotics services
+ox-services = { path = "../ox-services", optional = true }
