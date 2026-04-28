@@ -32,6 +32,13 @@ const sidebars: SidebarsConfig = {
         'guides/navigation',
       ],
     },
+    {
+      type: 'category',
+      label: 'Design',
+      items: [
+        'design/esp32-rust-rtos-and-sketch-api',
+      ],
+    },
   ],
   adrSidebar: [
     'decisions/intro',
